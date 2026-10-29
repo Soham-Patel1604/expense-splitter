@@ -1,11 +1,15 @@
 import 'package:flutter/foundation.dart';
+import 'package:sqflite/sqflite.dart';
 import 'package:uuid/uuid.dart';
 
 import '../database/database.dart';
-import '../models/group.dart';
-import '../models/friend_input.dart';
-import '../models/settlement.dart';
 import '../models/expense.dart';
+import '../models/friend_input.dart';
+import '../models/group.dart';
+import '../models/group_member.dart';
+import '../models/settlement.dart';
+import '../utils/balance_calculator.dart';
+import 'user_repository.dart';
 
 class GroupRepository {
   final AppDatabase _database;
@@ -26,27 +30,8 @@ class GroupRepository {
     return result.map((map) => Group.fromMap(map)).toList();
   }
 
-  /// Create a new group
-  Future<String> createGroup(
-    String groupId,
-    String name,
-    String? description,
-    String createdBy,
-  ) async {
-    final db = await _database.database;
-
-    await db.insert('groups', {
-      'id': groupId,
-      'name': name,
-      'description': description,
-      'createdAt': DateTime.now().millisecondsSinceEpoch,
-      'createdBy': createdBy,
-    });
-
-    return groupId;
-  }
-
-  /// Create a comprehensive group with members (atomic transaction)
+  /// Create a comprehensive group with members (atomic transaction).
+  /// Anything paid up front is split equally among every member.
   Future<void> createGroupWithMembers({
     required String name,
     required String currentUserId,
@@ -68,68 +53,55 @@ class GroupRepository {
           'createdBy': currentUserId,
         });
 
-        // 2. Ensure current user exists and add them as member
+        // 2. Add the creator as the first member
         await txn.insert('group_members', {
           'id': const Uuid().v4(),
           'groupId': groupId,
           'userId': currentUserId,
         });
 
-        // 3. Process friends
+        final memberIds = <String>[currentUserId];
+        final payments = <String, double>{
+          if (creatorAmountPaid > 0) currentUserId: creatorAmountPaid,
+        };
+
+        // 3. Add friends, reusing anyone who already exists on this device
         for (final friend in friends) {
-          // Check if user already exists
-          final existingUsers = await txn.query(
-            'users',
-            where: 'name = ? AND phone = ?',
-            whereArgs: [friend.name, friend.phone],
-          );
+          final friendUserId = (await findOrCreateUser(
+            txn,
+            name: friend.name,
+            phone: friend.phone,
+          )).id;
 
-          String friendUserId;
-
-          if (existingUsers.isNotEmpty) {
-            // User already exists
-            friendUserId = existingUsers.first['id'] as String;
-          } else {
-            // Create new user
-            friendUserId = const Uuid().v4();
-            await txn.insert('users', {
-              'id': friendUserId,
-              'name': friend.name,
-              'phone': friend.phone,
-              'createdAt': now,
-            });
+          if (memberIds.contains(friendUserId)) {
+            throw Exception(
+              '${normalizeName(friend.name)} is already in this event',
+            );
           }
+          memberIds.add(friendUserId);
 
-          // Add friend as group member
           await txn.insert('group_members', {
             'id': const Uuid().v4(),
             'groupId': groupId,
             'userId': friendUserId,
           });
 
-          // Store friend's payment as expense if amount > 0
           if (friend.amountPaid > 0) {
-            await txn.insert('expenses', {
-              'id': const Uuid().v4(),
-              'groupId': groupId,
-              'paidByUserId': friendUserId,
-              'amount': friend.amountPaid,
-              'description': 'Initial payment',
-              'createdAt': now,
-            });
+            payments[friendUserId] = friend.amountPaid;
           }
         }
 
-        // 4. Store creator's payment as expense if amount > 0
-        if (creatorAmountPaid > 0) {
-          await txn.insert('expenses', {
-            'id': const Uuid().v4(),
-            'groupId': groupId,
-            'paidByUserId': currentUserId,
-            'amount': creatorAmountPaid,
-            'description': 'Initial payment',
-            'createdAt': now,
-          });
+        // 4. Up-front payments become expenses shared by the whole event
+        for (final payment in payments.entries) {
+          await _insertExpense(
+            txn,
+            groupId: groupId,
+            paidByUserId: payment.key,
+            amount: payment.value,
+            description: 'Initial payment',
+            shares: splitEqually(payment.value, memberIds),
+            createdAt: now,
+          );
         }
       });
     } catch (e) {
@@ -159,28 +131,21 @@ class GroupRepository {
           whereArgs: [groupId],
         );
 
-        // 3. Delete expense splits for this group
-        await txn.delete(
-          'expense_splits',
-          where: 'groupId = ?',
-          whereArgs: [groupId],
-        );
-
-        // 4. Delete expenses for this group
+        // 3. Delete expenses for this group
         await txn.delete(
           'expenses',
           where: 'groupId = ?',
           whereArgs: [groupId],
         );
 
-        // 5. Delete group members
+        // 4. Delete group members
         await txn.delete(
           'group_members',
           where: 'groupId = ?',
           whereArgs: [groupId],
         );
 
-        // 6. Delete the group record itself
+        // 5. Delete the group record itself
         await txn.delete(
           'groups',
           where: 'id = ?',
@@ -210,102 +175,65 @@ class GroupRepository {
     return Group.fromMap(result.first);
   }
 
-  /// Calculate user's net balance in a specific group
-  /// net = credit - debit - settlement_in + settlement_out
+  /// Every member's net position in a group
+  /// (positive = owed money, negative = owes money).
+  Future<Map<String, double>> getGroupBalances(String groupId) async {
+    final db = await _database.database;
+
+    final memberRows = await db.query(
+      'group_members',
+      columns: ['userId'],
+      where: 'groupId = ?',
+      whereArgs: [groupId],
+    );
+
+    return computeBalances(
+      memberIds: memberRows.map((row) => row['userId'] as String),
+      expenses: await getGroupExpenses(groupId),
+      settlements: await getGroupSettlements(groupId),
+    );
+  }
+
+  /// The user's net balance in a group (positive = others owe them).
   Future<double> getUserNetBalanceForGroup(
     String groupId,
     String userId,
   ) async {
-    final db = await _database.database;
-
-    // Credit: amount owed to user
-    final creditResult = await db.rawQuery(
-      'SELECT COALESCE(SUM(amount), 0) as total FROM expense_splits '
-      'WHERE groupId = ? AND toUserId = ?',
-      [groupId, userId],
-    );
-    final credit = (creditResult.first['total'] as num).toDouble();
-
-    // Debit: amount user owes
-    final debitResult = await db.rawQuery(
-      'SELECT COALESCE(SUM(amount), 0) as total FROM expense_splits '
-      'WHERE groupId = ? AND fromUserId = ?',
-      [groupId, userId],
-    );
-    final debit = (debitResult.first['total'] as num).toDouble();
-
-    // Settlement in: payments received by user
-    final settlementInResult = await db.rawQuery(
-      'SELECT COALESCE(SUM(amount), 0) as total FROM settlements '
-      'WHERE groupId = ? AND toUserId = ?',
-      [groupId, userId],
-    );
-    final settlementIn = (settlementInResult.first['total'] as num).toDouble();
-
-    // Settlement out: payments made by user
-    final settlementOutResult = await db.rawQuery(
-      'SELECT COALESCE(SUM(amount), 0) as total FROM settlements '
-      'WHERE groupId = ? AND fromUserId = ?',
-      [groupId, userId],
-    );
-    final settlementOut = (settlementOutResult.first['total'] as num)
-        .toDouble();
-
-    // Formula: credit - debit - settlement_in + settlement_out
-    final netBalance = credit - debit - settlementIn + settlementOut;
-
-    return netBalance;
-  }
-
-  /// Calculate overall net balance across all groups
-  Future<double> getOverallNetBalance(String userId) async {
-    try {
-      final groups = await getAllGroupsForUser(userId);
-
-      double totalBalance = 0;
-
-      for (final group in groups) {
-        final balance = await getUserNetBalanceForGroup(group.id, userId);
-        totalBalance += balance;
-      }
-
-      return totalBalance;
-    } catch (e) {
-      debugPrint('Error calculating overall balance: $e');
-      return 0;
-    }
+    final balances = await getGroupBalances(groupId);
+    return balances[userId] ?? 0.0;
   }
 
   /// Get groups with balance view (includes calculated balance)
   Future<List<GroupBalanceView>> getGroupsWithBalance(String userId) async {
-    try {
-      final groups = await getAllGroupsForUser(userId);
+    final groups = await getAllGroupsForUser(userId);
 
-      final List<GroupBalanceView> result = [];
-
-      for (final group in groups) {
-        final balance = await getUserNetBalanceForGroup(group.id, userId);
-        result.add(GroupBalanceView(group: group, netBalance: balance));
-      }
-
-      return result;
-    } catch (e) {
-      debugPrint('Error fetching groups with balance: $e');
-      return [];
+    final List<GroupBalanceView> result = [];
+    for (final group in groups) {
+      final balance = await getUserNetBalanceForGroup(group.id, userId);
+      result.add(GroupBalanceView(group: group, netBalance: balance));
     }
+
+    return result;
   }
 
-  /// Add a member to a group
-  Future<void> addMemberToGroup(String groupId, String userId) async {
+  /// Member count of every group the user belongs to, in one query.
+  Future<Map<String, int>> getMemberCountsForUser(String userId) async {
     final db = await _database.database;
-    final memberId =
-        '${groupId}_${userId}_${DateTime.now().millisecondsSinceEpoch}';
 
-    await db.insert('group_members', {
-      'id': memberId,
-      'groupId': groupId,
-      'userId': userId,
-    });
+    final result = await db.rawQuery(
+      '''
+      SELECT groupId, COUNT(*) AS members
+      FROM group_members
+      WHERE groupId IN (SELECT groupId FROM group_members WHERE userId = ?)
+      GROUP BY groupId
+    ''',
+      [userId],
+    );
+
+    return {
+      for (final row in result)
+        row['groupId'] as String: (row['members'] as num).toInt(),
+    };
   }
 
   /// Update the name of a group
@@ -324,51 +252,30 @@ class GroupRepository {
     );
   }
 
-  /// Add a new member to an existing group, creating the user record if needed
+  /// Add a new member to an existing group, reusing the person if they
+  /// already exist on this device
   Future<void> addNewMemberToGroup(
     String groupId,
     String name,
     String? phone,
   ) async {
-    final trimmedName = name.trim();
-    final trimmedPhone =
-        phone != null && phone.trim().isNotEmpty ? phone.trim() : null;
-
-    if (trimmedName.isEmpty) {
+    final cleanName = normalizeName(name);
+    if (cleanName.isEmpty) {
       throw ArgumentError('Member name cannot be empty');
     }
 
     final db = await _database.database;
-    final now = DateTime.now().millisecondsSinceEpoch;
 
     try {
       await db.transaction((txn) async {
-        // 1. Check if user already exists
-        final existingUsers = await txn.query(
-          'users',
-          where: trimmedPhone != null
-              ? 'name = ? AND phone = ?'
-              : 'name = ? AND (phone IS NULL OR phone = "")',
-          whereArgs: trimmedPhone != null
-              ? [trimmedName, trimmedPhone]
-              : [trimmedName],
-        );
+        // 1. Find or create the person
+        final memberUserId = (await findOrCreateUser(
+          txn,
+          name: cleanName,
+          phone: phone,
+        )).id;
 
-        String memberUserId;
-        if (existingUsers.isNotEmpty) {
-          memberUserId = existingUsers.first['id'] as String;
-        } else {
-          // Create new user
-          memberUserId = const Uuid().v4();
-          await txn.insert('users', {
-            'id': memberUserId,
-            'name': trimmedName,
-            'phone': trimmedPhone,
-            'createdAt': now,
-          });
-        }
-
-        // 2. Check if user is already a member of this group
+        // 2. Check if they are already a member of this group
         final existingMembership = await txn.query(
           'group_members',
           where: 'groupId = ? AND userId = ?',
@@ -376,14 +283,12 @@ class GroupRepository {
         );
 
         if (existingMembership.isNotEmpty) {
-          throw Exception('$trimmedName is already a member of this event');
+          throw Exception('$cleanName is already a member of this event');
         }
 
         // 3. Insert into group_members
-        final memberId =
-            '${groupId}_${memberUserId}_${DateTime.now().millisecondsSinceEpoch}';
         await txn.insert('group_members', {
-          'id': memberId,
+          'id': const Uuid().v4(),
           'groupId': groupId,
           'userId': memberUserId,
         });
@@ -394,45 +299,33 @@ class GroupRepository {
     }
   }
 
-  /// Get group members with their payment details
+  /// Get group members with the total each has paid, in join order
   Future<List<GroupMember>> getGroupMembersWithPayments(String groupId) async {
     final db = await _database.database;
 
-    // Get all members in the group
-    final membersResult = await db.rawQuery(
+    final result = await db.rawQuery(
       '''
-      SELECT DISTINCT u.id, u.name 
-      FROM users u
-      INNER JOIN group_members gm ON u.id = gm.userId
+      SELECT u.id, u.name, COALESCE(SUM(e.amount), 0) AS paid
+      FROM group_members gm
+      INNER JOIN users u ON u.id = gm.userId
+      LEFT JOIN expenses e
+        ON e.groupId = gm.groupId AND e.paidByUserId = gm.userId
       WHERE gm.groupId = ?
+      GROUP BY u.id, u.name
+      ORDER BY MIN(gm.rowid)
     ''',
       [groupId],
     );
 
-    final List<GroupMember> members = [];
-
-    for (final memberRow in membersResult) {
-      final userId = memberRow['id'] as String;
-      final userName = memberRow['name'] as String;
-
-      // Get total amount paid by this user in this group
-      final expensesResult = await db.rawQuery(
-        '''
-        SELECT COALESCE(SUM(amount), 0) as total
-        FROM expenses
-        WHERE groupId = ? AND paidByUserId = ?
-      ''',
-        [groupId, userId],
-      );
-
-      final amountPaid = (expensesResult.first['total'] as num).toDouble();
-
-      members.add(
-        GroupMember(userId: userId, userName: userName, amountPaid: amountPaid),
-      );
-    }
-
-    return members;
+    return result
+        .map(
+          (row) => GroupMember(
+            userId: row['id'] as String,
+            userName: row['name'] as String,
+            amountPaid: (row['paid'] as num).toDouble(),
+          ),
+        )
+        .toList();
   }
 
   /// Get existing settlements for a group
@@ -441,7 +334,7 @@ class GroupRepository {
 
     final result = await db.rawQuery(
       '''
-      SELECT s.*, 
+      SELECT s.*,
              u1.name as fromName,
              u2.name as toName
       FROM settlements s
@@ -464,216 +357,95 @@ class GroupRepository {
         .toList();
   }
 
-  /// Calculate pending settlements for a group
-  /// Uses the "debt simplification" algorithm with smart merge logic
+  /// Calculate pending settlements for a group using greedy debt
+  /// simplification over the same balances every other screen shows
   Future<List<Settlement>> calculatePendingSettlements(String groupId) async {
-    const epsilon = 0.01;
+    final members = await getGroupMembersWithPayments(groupId);
+    final userNames = {for (final m in members) m.userId: m.userName};
+    final balances = await getGroupBalances(groupId);
 
-    try {
-      // Get all group members
-      final membersResult = await (await _database.database).rawQuery(
-        '''
-        SELECT DISTINCT u.id, u.name 
-        FROM users u
-        INNER JOIN group_members gm ON u.id = gm.userId
-        WHERE gm.groupId = ?
-      ''',
-        [groupId],
-      );
-
-      if (membersResult.isEmpty) {
-        return [];
-      }
-
-      // Initialize balance tracking
-      final Map<String, double> balances = {};
-      final Map<String, String> userNames = {};
-
-      for (final member in membersResult) {
-        final userId = member['id'] as String;
-        final userName = member['name'] as String;
-        balances[userId] = 0.0;
-        userNames[userId] = userName;
-      }
-
-      // Get all expenses for the group
-      final expenses = await getGroupExpenses(groupId);
-
-      // Calculate balances from all expenses
-      for (final expense in expenses) {
-        final sharePerParticipant = expense.sharePerParticipant;
-
-        // The payer should receive money from all other participants
-        for (final participantId in expense.participantIds) {
-          if (participantId == expense.paidByUserId) {
-            // Payer paid their own share, net effect is they paid for others
-            balances[participantId] =
-                (balances[participantId] ?? 0) +
-                (expense.amount - sharePerParticipant);
-          } else {
-            // Other participants owe their share to the payer
-            balances[participantId] =
-                (balances[participantId] ?? 0) - sharePerParticipant;
-          }
-        }
-      }
-
-      // Apply existing settlements to adjust balances
-      final existingSettlements = await getGroupSettlements(groupId);
-      for (final settlement in existingSettlements) {
-        // When someone pays a settlement:
-        // - The payer (fromUser) has paid, so their net balance increases
-        // - The receiver (toUser) has received, so their net balance decreases
-        balances[settlement.fromUserId] =
-            (balances[settlement.fromUserId] ?? 0) + settlement.amount;
-        balances[settlement.toUserId] =
-            (balances[settlement.toUserId] ?? 0) - settlement.amount;
-      }
-
-      // Separate creditors (people who are owed) and debtors (people who owe)
-      final List<MapEntry<String, double>> creditors = [];
-      final List<MapEntry<String, double>> debtors = [];
-
-      balances.forEach((userId, balance) {
-        // Only consider significant amounts (ignore very small differences due to rounding)
-        if (balance > epsilon) {
-          creditors.add(MapEntry(userId, balance));
-        } else if (balance < -epsilon) {
-          debtors.add(
-            MapEntry(userId, -balance),
-          ); // Convert to positive for easier calculation
-        }
-      });
-
-      // Deterministic ordering keeps settlement suggestions stable across refreshes.
-      creditors.sort((a, b) => b.value.compareTo(a.value));
-      debtors.sort((a, b) => b.value.compareTo(a.value));
-
-      // Generate minimal settlements using greedy algorithm
-      final List<Settlement> pendingSettlements = [];
-
-      int creditorIdx = 0;
-      int debtorIdx = 0;
-
-      while (creditorIdx < creditors.length && debtorIdx < debtors.length) {
-        final creditor = creditors[creditorIdx];
-        final debtor = debtors[debtorIdx];
-
-        final amountToSettle = creditor.value < debtor.value
-            ? creditor.value
-            : debtor.value;
-
-        // Create settlement: debtor pays creditor
-        if (amountToSettle > epsilon) {
-          pendingSettlements.add(
-            Settlement.calculated(
-              fromUserId: debtor.key,
-              fromUserName: userNames[debtor.key]!,
-              toUserId: creditor.key,
-              toUserName: userNames[creditor.key]!,
-              amount: amountToSettle,
-              groupId: groupId,
-            ),
-          );
-        }
-
-        // Update remaining amounts
-        creditors[creditorIdx] = MapEntry(
-          creditor.key,
-          creditor.value - amountToSettle,
-        );
-        debtors[debtorIdx] = MapEntry(
-          debtor.key,
-          debtor.value - amountToSettle,
-        );
-
-        // Move to next creditor/debtor if current one is settled
-        if (creditors[creditorIdx].value < epsilon) {
-          creditorIdx++;
-        }
-        if (debtors[debtorIdx].value < epsilon) {
-          debtorIdx++;
-        }
-      }
-
-      return pendingSettlements;
-    } catch (e) {
-      debugPrint('Error calculating settlements: $e');
-      return [];
-    }
+    return simplifyDebts(balances)
+        .map(
+          (transfer) => Settlement.calculated(
+            fromUserId: transfer.fromUserId,
+            fromUserName: userNames[transfer.fromUserId] ?? 'Unknown',
+            toUserId: transfer.toUserId,
+            toUserName: userNames[transfer.toUserId] ?? 'Unknown',
+            amount: transfer.amount,
+            groupId: groupId,
+          ),
+        )
+        .toList();
   }
 
-  /// Mark a settlement as paid
-  Future<void> markSettlementAsPaid(Settlement settlement) async {
+  /// Record a payment for a suggested settlement. [amount] defaults to the
+  /// full suggested amount; a smaller value records a partial payment.
+  /// Returns the new settlement's ID (used for undo).
+  Future<String> markSettlementAsPaid(
+    Settlement settlement, {
+    double? amount,
+  }) async {
+    final paid = roundMoney(amount ?? settlement.amount);
+    if (paid <= 0) {
+      throw ArgumentError('Payment amount must be greater than zero');
+    }
+
     final db = await _database.database;
+    final settlementId = const Uuid().v4();
 
     await db.insert('settlements', {
-      'id': const Uuid().v4(),
+      'id': settlementId,
       'groupId': settlement.groupId,
       'fromUserId': settlement.fromUserId,
       'toUserId': settlement.toUserId,
-      'amount': settlement.amount,
+      'amount': paid,
       'createdAt': DateTime.now().millisecondsSinceEpoch,
     });
+
+    return settlementId;
   }
 
-  /// Add an expense split
-  Future<void> addExpenseSplit(ExpenseSplit split) async {
+  /// Undo a recorded payment
+  Future<void> deleteSettlement(String settlementId) async {
     final db = await _database.database;
-
-    await db.insert('expense_splits', split.toMap());
+    await db.delete(
+      'settlements',
+      where: 'id = ?',
+      whereArgs: [settlementId],
+    );
   }
 
-  /// Add a new expense with participants (atomic transaction)
+  /// Add a new expense (atomic transaction). Without [shares] the amount is
+  /// split equally among [participantIds]; with [shares] each person owes
+  /// exactly their entry (unequal / percentage splits).
   Future<void> addExpense({
     required String groupId,
     required String description,
     required double amount,
     required String paidByUserId,
     required List<String> participantIds,
+    Map<String, double>? shares,
     String category = 'other',
     String? note,
     String splitType = 'equal',
   }) async {
+    final resolvedShares = _resolveShares(amount, participantIds, shares);
     final db = await _database.database;
-    final expenseId = const Uuid().v4();
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final cleanedParticipantIds = participantIds
-        .map((id) => id.trim())
-        .where((id) => id.isNotEmpty)
-        .toSet()
-        .toList();
-
-    if (amount <= 0) {
-      throw ArgumentError('Expense amount must be greater than zero');
-    }
-
-    if (cleanedParticipantIds.isEmpty) {
-      throw ArgumentError('At least one participant is required');
-    }
 
     try {
       await db.transaction((txn) async {
-        // 1. Insert the expense
-        await txn.insert('expenses', {
-          'id': expenseId,
-          'groupId': groupId,
-          'paidByUserId': paidByUserId,
-          'amount': amount,
-          'description': description,
-          'category': category,
-          'note': note,
-          'splitType': splitType,
-          'createdAt': now,
-        });
-
-        // 2. Insert all participants
-        for (final participantId in cleanedParticipantIds) {
-          await txn.insert('expense_participants', {
-            'expenseId': expenseId,
-            'userId': participantId,
-          });
-        }
+        await _insertExpense(
+          txn,
+          groupId: groupId,
+          paidByUserId: paidByUserId,
+          amount: amount,
+          description: description,
+          category: category,
+          note: note,
+          splitType: splitType,
+          shares: resolvedShares,
+          createdAt: DateTime.now().millisecondsSinceEpoch,
+        );
       });
     } catch (e) {
       debugPrint('Error adding expense: $e');
@@ -681,31 +453,20 @@ class GroupRepository {
     }
   }
 
-  /// Update an existing expense with participants (atomic transaction)
+  /// Update an existing expense and its shares (atomic transaction)
   Future<void> updateExpense({
     required String expenseId,
     required String description,
     required double amount,
     required String paidByUserId,
     required List<String> participantIds,
+    Map<String, double>? shares,
     String category = 'other',
     String? note,
     String splitType = 'equal',
   }) async {
+    final resolvedShares = _resolveShares(amount, participantIds, shares);
     final db = await _database.database;
-    final cleanedParticipantIds = participantIds
-        .map((id) => id.trim())
-        .where((id) => id.isNotEmpty)
-        .toSet()
-        .toList();
-
-    if (amount <= 0) {
-      throw ArgumentError('Expense amount must be greater than zero');
-    }
-
-    if (cleanedParticipantIds.isEmpty) {
-      throw ArgumentError('At least one participant is required');
-    }
 
     try {
       await db.transaction((txn) async {
@@ -714,7 +475,7 @@ class GroupRepository {
           'expenses',
           {
             'paidByUserId': paidByUserId,
-            'amount': amount,
+            'amount': roundMoney(amount),
             'description': description,
             'category': category,
             'note': note,
@@ -724,24 +485,92 @@ class GroupRepository {
           whereArgs: [expenseId],
         );
 
-        // 2. Remove old participants
+        // 2. Replace the participants and their shares
         await txn.delete(
           'expense_participants',
           where: 'expenseId = ?',
           whereArgs: [expenseId],
         );
-
-        // 3. Re-insert new participants
-        for (final participantId in cleanedParticipantIds) {
-          await txn.insert('expense_participants', {
-            'expenseId': expenseId,
-            'userId': participantId,
-          });
-        }
+        await _insertShares(txn, expenseId, resolvedShares);
       });
     } catch (e) {
       debugPrint('Error updating expense: $e');
       rethrow;
+    }
+  }
+
+  /// Validates the amount and turns the caller's split into exact shares.
+  Map<String, double> _resolveShares(
+    double amount,
+    List<String> participantIds,
+    Map<String, double>? shares,
+  ) {
+    if (amount <= 0) {
+      throw ArgumentError('Expense amount must be greater than zero');
+    }
+
+    final Map<String, double> resolved;
+    if (shares == null) {
+      final cleanedIds = participantIds
+          .map((id) => id.trim())
+          .where((id) => id.isNotEmpty)
+          .toSet()
+          .toList();
+      resolved = splitEqually(amount, cleanedIds);
+    } else {
+      final total = shares.values.fold<double>(0.0, (a, b) => a + b);
+      if ((total - amount).abs() > 0.01) {
+        throw ArgumentError('Shares must add up to the expense amount');
+      }
+      resolved = fitSharesToTotal(amount, shares);
+    }
+
+    if (resolved.isEmpty) {
+      throw ArgumentError('At least one participant is required');
+    }
+    return resolved;
+  }
+
+  Future<void> _insertExpense(
+    DatabaseExecutor executor, {
+    required String groupId,
+    required String paidByUserId,
+    required double amount,
+    required String description,
+    required Map<String, double> shares,
+    required int createdAt,
+    String category = 'other',
+    String? note,
+    String splitType = 'equal',
+  }) async {
+    final expenseId = const Uuid().v4();
+
+    await executor.insert('expenses', {
+      'id': expenseId,
+      'groupId': groupId,
+      'paidByUserId': paidByUserId,
+      'amount': roundMoney(amount),
+      'description': description,
+      'category': category,
+      'note': note,
+      'splitType': splitType,
+      'createdAt': createdAt,
+    });
+
+    await _insertShares(executor, expenseId, shares);
+  }
+
+  Future<void> _insertShares(
+    DatabaseExecutor executor,
+    String expenseId,
+    Map<String, double> shares,
+  ) async {
+    for (final share in shares.entries) {
+      await executor.insert('expense_participants', {
+        'expenseId': expenseId,
+        'userId': share.key,
+        'shareAmount': share.value,
+      });
     }
   }
 
@@ -770,64 +599,67 @@ class GroupRepository {
     }
   }
 
-  /// Get all expenses for a group
+  /// Get all expenses for a group, newest first (two queries in total)
   Future<List<Expense>> getGroupExpenses(String groupId) async {
     final db = await _database.database;
 
-    // Get all expenses for the group
-    final expensesResult = await db.query(
-      'expenses',
-      where: 'groupId = ?',
-      whereArgs: [groupId],
-      orderBy: 'createdAt DESC',
+    final expenseRows = await db.rawQuery(
+      '''
+      SELECT e.*, u.name AS payerName
+      FROM expenses e
+      LEFT JOIN users u ON u.id = e.paidByUserId
+      WHERE e.groupId = ?
+      ORDER BY e.createdAt DESC, e.rowid DESC
+    ''',
+      [groupId],
     );
 
-    final List<Expense> expenses = [];
+    final participantRows = await db.rawQuery(
+      '''
+      SELECT ep.expenseId, ep.userId, ep.shareAmount, u.name
+      FROM expense_participants ep
+      INNER JOIN expenses e ON e.id = ep.expenseId
+      INNER JOIN users u ON u.id = ep.userId
+      WHERE e.groupId = ?
+      ORDER BY ep.rowid
+    ''',
+      [groupId],
+    );
 
-    for (final expenseMap in expensesResult) {
-      final expenseId = expenseMap['id'] as String;
-      final paidByUserId = expenseMap['paidByUserId'] as String;
-
-      // Get payer name
-      final payerResult = await db.query(
-        'users',
-        columns: ['name'],
-        where: 'id = ?',
-        whereArgs: [paidByUserId],
-      );
-      final payerName = payerResult.isNotEmpty
-          ? payerResult.first['name'] as String
-          : 'Unknown';
-
-      // Get participants
-      final participantsResult = await db.rawQuery(
-        '''
-        SELECT u.id, u.name
-        FROM users u
-        INNER JOIN expense_participants ep ON u.id = ep.userId
-        WHERE ep.expenseId = ?
-      ''',
-        [expenseId],
-      );
-
-      final participantIds = participantsResult
-          .map((row) => row['id'] as String)
-          .toList();
-      final participantNames = participantsResult
-          .map((row) => row['name'] as String)
-          .toList();
-
-      expenses.add(
-        Expense.fromMap(
-          expenseMap,
-          payerName,
-          participantIds,
-          participantNames,
-        ),
-      );
+    final participantsByExpense = <String, List<Map<String, Object?>>>{};
+    for (final row in participantRows) {
+      participantsByExpense
+          .putIfAbsent(row['expenseId'] as String, () => [])
+          .add(row);
     }
 
-    return expenses;
+    return expenseRows.map((expenseMap) {
+      final participants =
+          participantsByExpense[expenseMap['id'] as String] ?? const [];
+      final participantIds = [
+        for (final p in participants) p['userId'] as String,
+      ];
+      final amount = (expenseMap['amount'] as num).toDouble();
+
+      // Rows written before v5 have no stored shares: they were equal splits.
+      final hasStoredShares =
+          participants.isNotEmpty &&
+          participants.every((p) => p['shareAmount'] != null);
+      final shares = hasStoredShares
+          ? {
+              for (final p in participants)
+                p['userId'] as String: (p['shareAmount'] as num).toDouble(),
+            }
+          : splitEqually(amount, participantIds);
+
+      return Expense.fromMap(
+        expenseMap,
+        (expenseMap['payerName'] as String?) ?? 'Unknown',
+        participantIds,
+        [for (final p in participants) p['name'] as String],
+        shares,
+      );
+    }).toList();
   }
 
   /// Aggregate total spend by category for a group.
@@ -855,59 +687,47 @@ class GroupRepository {
     return categoryTotals;
   }
 
-  /// Aggregate member-level paid/owed values for a group.
-  Future<List<MemberExpenseStats>> getGroupMemberExpenseStats(
-    String groupId,
-  ) async {
+  /// Build the stats view model used by the insights page. Member net
+  /// positions include settlements, so they match the Settle tab.
+  Future<GroupExpenseStats> getGroupExpenseStats(String groupId) async {
     final members = await getGroupMembersWithPayments(groupId);
     final expenses = await getGroupExpenses(groupId);
-    final amountOwedByUser = <String, double>{};
+    final settlements = await getGroupSettlements(groupId);
+    final categoryTotals = await getGroupCategoryTotals(groupId);
 
-    for (final member in members) {
-      amountOwedByUser[member.userId] = 0.0;
-    }
-
+    final amountOwedByUser = <String, double>{
+      for (final member in members) member.userId: 0.0,
+    };
     for (final expense in expenses) {
-      if (expense.participantIds.isEmpty) {
-        continue;
-      }
-
-      final share = expense.sharePerParticipant;
-      for (final participantId in expense.participantIds) {
-        amountOwedByUser[participantId] =
-            (amountOwedByUser[participantId] ?? 0) + share;
-      }
+      expense.shares.forEach((userId, share) {
+        amountOwedByUser[userId] = (amountOwedByUser[userId] ?? 0) + share;
+      });
     }
 
-    final stats = members
+    final balances = computeBalances(
+      memberIds: members.map((m) => m.userId),
+      expenses: expenses,
+      settlements: settlements,
+    );
+
+    final memberStats = members
         .map(
           (member) => MemberExpenseStats(
             userId: member.userId,
             userName: member.userName,
             amountPaid: member.amountPaid,
-            amountOwed: amountOwedByUser[member.userId] ?? 0,
+            amountOwed: roundMoney(amountOwedByUser[member.userId] ?? 0),
+            netBalance: balances[member.userId] ?? 0,
           ),
         )
-        .toList();
-
-    stats.sort((a, b) => b.netBalance.compareTo(a.netBalance));
-    return stats;
-  }
-
-  /// Build a compact stats view model used by the group details page.
-  Future<GroupExpenseStats> getGroupExpenseStats(String groupId) async {
-    final expenses = await getGroupExpenses(groupId);
-    final categoryTotals = await getGroupCategoryTotals(groupId);
-    final memberStats = await getGroupMemberExpenseStats(groupId);
-
-    final totalAmount = expenses.fold<double>(
-      0.0,
-      (sum, expense) => sum + expense.amount,
-    );
+        .toList()
+      ..sort((a, b) => b.netBalance.compareTo(a.netBalance));
 
     return GroupExpenseStats(
       expenseCount: expenses.length,
-      totalAmount: totalAmount,
+      totalAmount: roundMoney(
+        expenses.fold<double>(0.0, (sum, expense) => sum + expense.amount),
+      ),
       categoryTotals: categoryTotals,
       memberStats: memberStats,
     );

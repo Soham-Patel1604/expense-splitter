@@ -49,17 +49,24 @@ class _LoginPageState extends State<LoginPage> {
       final name = _nameController.text.trim();
       final phone = _phoneController.text.trim();
 
-      // Create user in database
-      final userId = await _userRepository.createUser(
+      // Reuse the profile with this name (so its events come back) or
+      // create a new one
+      final login = await _userRepository.loginOrCreate(
         name,
         phone.isEmpty ? null : phone,
       );
 
       // Save current user ID to SharedPreferences
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('currentUserId', userId);
+      await prefs.setString('currentUserId', login.id);
 
       if (mounted) {
+        if (login.existed) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Welcome back, $name')),
+          );
+        }
+
         // Navigate to GroupsListPage
         Navigator.pushReplacement(
           context,
@@ -67,6 +74,7 @@ class _LoginPageState extends State<LoginPage> {
         );
       }
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _errorMessage = 'Failed to create profile: ${e.toString()}';
         _isLoading = false;
@@ -115,6 +123,12 @@ class _LoginPageState extends State<LoginPage> {
                   Text(
                     "Let's set up your profile",
                     style: theme.textTheme.bodyMedium,
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Used this name before? Enter it again to get your '
+                    'events back.',
+                    style: theme.textTheme.labelMedium,
                   ),
                   const SizedBox(height: 32),
 

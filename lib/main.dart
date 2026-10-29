@@ -3,10 +3,11 @@ import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'dart:io';
+import 'database/database.dart';
 import 'pages/login_page.dart';
 import 'pages/groups_list_page.dart';
+import 'repositories/user_repository.dart';
 import 'theme/app_theme.dart';
-import 'utils/currency.dart';
 
 /// Global notifier to manage and notify theme mode changes across the app
 final ValueNotifier<ThemeMode> themeNotifier = ValueNotifier<ThemeMode>(
@@ -64,9 +65,6 @@ void main() async {
     debugPrint('Error loading theme preference: $e');
   }
 
-  // Load saved currency preference
-  await getCurrencySymbol();
-
   // Initialize sqflite based on platform
   if (!kIsWeb) {
     // Only use FFI for desktop platforms (Windows, macOS, Linux)
@@ -75,9 +73,36 @@ void main() async {
       databaseFactory = databaseFactoryFfi;
     }
     // For Android and iOS, sqflite works natively without FFI
+
+    await _mergeDuplicateUsersOnce();
   }
 
   runApp(const MyApp());
+}
+
+/// Older versions created a new person on every login and for every friend
+/// added without a phone, which scattered one person's events across several
+/// profiles. Folding them together once lets a login by name bring all of
+/// those events back.
+Future<void> _mergeDuplicateUsersOnce() async {
+  const doneKey = 'duplicateUsersMerged';
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    if (prefs.getBool(doneKey) ?? false) return;
+
+    final currentUserId = prefs.getString('currentUserId');
+    final merged = await UserRepository(
+      database: AppDatabase(),
+    ).mergeDuplicateUsers(preferredUserId: currentUserId);
+
+    final mergedInto = merged[currentUserId];
+    if (mergedInto != null) {
+      await prefs.setString('currentUserId', mergedInto);
+    }
+    await prefs.setBool(doneKey, true);
+  } catch (e) {
+    debugPrint('Error merging duplicate users: $e');
+  }
 }
 
 class MyApp extends StatelessWidget {
@@ -264,7 +289,17 @@ class AppEntry extends StatelessWidget {
     try {
       final prefs = await SharedPreferences.getInstance();
       final userId = prefs.getString('currentUserId');
-      return userId != null;
+      if (userId == null) return false;
+
+      // A session pointing at a profile that no longer exists is logged out.
+      final user = await UserRepository(
+        database: AppDatabase(),
+      ).getUserById(userId);
+      if (user == null) {
+        await prefs.remove('currentUserId');
+        return false;
+      }
+      return true;
     } catch (e) {
       debugPrint('Error checking user: $e');
       return false;

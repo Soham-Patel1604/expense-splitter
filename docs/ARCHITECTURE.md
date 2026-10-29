@@ -1,17 +1,19 @@
-# Expense Splitter — Architecture & Implementation Plan
+# Expense Splitter — Architecture
 
-> Complete reference for any AI model or developer to understand, navigate, and extend this project.
+> Reference for any AI model or developer to understand, navigate, and extend this project. Updated for **v1.0.1** (database schema v5).
 
 ---
 
 ## 1. Project Overview
 
-**Expense Splitter** is a Flutter mobile/desktop app (no web support) for splitting expenses among friends. Users create **groups** (called "Events"), add **expenses** with equal or unequal splits, and the app computes **settlements** (who owes whom) using a greedy debt-simplification algorithm.
+**Expense Splitter** is a Flutter app (Android, iOS, Windows, macOS, Linux; the web build only shows a "download the app" page) for splitting expenses among friends. Users create **groups** (called "Events"), add **expenses** with equal, unequal, or percentage splits, and the app computes **settlements** (who owes whom) using greedy debt simplification.
+
+All data is stored **locally on the device** — there is no server and no sync between phones.
 
 **Tech Stack:**
-- **Flutter 3.47.5** / Dart 3.13.4, Material 3
+- **Flutter 3.38+** / Dart 3.10+, Material 3
 - **SQLite** via `sqflite` (mobile) and `sqflite_common_ffi` (desktop)
-- **SharedPreferences** for session (current user ID)
+- **SharedPreferences** for session (current user ID) and theme
 - **UUID** for primary keys
 - No state management library (uses `StatefulWidget` + `FutureBuilder`)
 - No dependency injection framework (manual instantiation)
@@ -22,23 +24,32 @@
 
 ```
 lib/
-├── main.dart                          # Entry point, platform init, routing
+├── main.dart                          # Entry point, platform init, one-time user merge, routing
 ├── database/
-│   └── database.dart                  # SQLite singleton, schema, migrations
+│   └── database.dart                  # SQLite singleton, schema v5, migrations, FK pragma
 ├── models/
-│   ├── group.dart                     # Group, GroupBalanceView, ExpenseSplit
-│   ├── expense.dart                   # Expense, ExpenseParticipant, categories, stats models
-│   ├── settlement.dart                # Settlement, GroupMember
+│   ├── user.dart                      # User
+│   ├── group.dart                     # Group, GroupBalanceView
+│   ├── group_member.dart              # GroupMember (user + total paid in a group)
+│   ├── expense.dart                   # Expense (with per-person shares), categories, stats models
+│   ├── settlement.dart                # Settlement (paid or suggested)
 │   └── friend_input.dart              # FriendInput (create-group form DTO)
 ├── repositories/
-│   ├── user_repository.dart           # User CRUD + User model class
-│   └── group_repository.dart          # Group CRUD, expenses, settlements, stats
+│   ├── user_repository.dart           # Identity: findOrCreateUser, login, duplicate merge
+│   └── group_repository.dart          # Groups, expenses, settlements, stats (all SQL)
+├── utils/
+│   ├── balance_calculator.dart        # Pure money math: splits, balances, debt simplification
+│   ├── currency.dart                  # ₹ formatting with Indian digit grouping
+│   └── export.dart                    # Plain-text share summary
 └── pages/
-    ├── login_page.dart                # Name/phone profile creation
-    ├── groups_list_page.dart           # Home: overall balance + group list
-    ├── create_group_page.dart          # Create event with friends
-    ├── group_details_page.dart         # Event detail: settlements + stats
-    └── add_expense_page.dart           # Add expense: equal/unequal split
+    ├── login_page.dart                # Log in by name (reuses an existing profile)
+    ├── groups_list_page.dart          # Home: overall balance + event list
+    ├── create_group_page.dart         # Create event with friends + up-front payments
+    ├── group_details_page.dart        # Event: dashboard + Settle / Expenses / More tabs
+    ├── expense_insights_page.dart     # Totals, categories, per-member net position
+    ├── add_expense_page.dart          # Add / edit expense: equal, unequal, percentage
+    ├── expense_history_page.dart      # Timeline with search + category filter
+    └── profile_page.dart              # Edit name / phone
 ```
 
 ---
@@ -52,7 +63,10 @@ flowchart TD
         GLP["GroupsListPage"]
         CGP["CreateGroupPage"]
         GDP["GroupDetailsPage"]
+        EIP["ExpenseInsightsPage"]
         AEP["AddExpensePage"]
+        EHP["ExpenseHistoryPage"]
+        PP["ProfilePage"]
     end
 
     subgraph REPO["Repository Layer"]
@@ -60,31 +74,34 @@ flowchart TD
         GR["GroupRepository"]
     end
 
-    subgraph DATA["Data Layer"]
-        DB["AppDatabase (SQLite Singleton)"]
+    subgraph LOGIC["Pure logic (lib/utils)"]
+        BC["balance_calculator.dart"]
     end
 
-    subgraph LOCAL["Local Storage"]
+    subgraph DATA["Data Layer"]
+        DB["AppDatabase (SQLite Singleton)"]
         SP["SharedPreferences"]
     end
 
     LP --> UR
-    LP --> SP
+    PP --> UR
     GLP --> GR
-    GLP --> SP
     CGP --> GR
-    CGP --> UR
-    CGP --> SP
     GDP --> GR
+    EIP --> GR
     AEP --> GR
-
+    EHP --> GR
+    GR --> BC
+    GR --> UR
     UR --> DB
     GR --> DB
+    LP --> SP
+    GLP --> SP
 ```
 
 ---
 
-## 4. Database Schema (v4)
+## 4. Database Schema (v5)
 
 ```mermaid
 erDiagram
@@ -120,15 +137,7 @@ erDiagram
     expense_participants {
         TEXT expenseId FK
         TEXT userId FK
-    }
-    expense_splits {
-        TEXT id PK
-        TEXT groupId FK
-        TEXT fromUserId FK
-        TEXT toUserId FK
-        REAL amount
-        TEXT description
-        INTEGER createdAt
+        REAL shareAmount
     }
     settlements {
         TEXT id PK
@@ -146,9 +155,23 @@ erDiagram
     users ||--o{ expenses : "paidByUserId"
     expenses ||--o{ expense_participants : "expenseId"
     users ||--o{ expense_participants : "userId"
-    groups ||--o{ expense_splits : "groupId"
     groups ||--o{ settlements : "groupId"
 ```
+
+- `PRAGMA foreign_keys = ON` is set for every connection (`AppDatabase.configure`), so the foreign keys above are enforced. Delete children before parents.
+- `expense_participants.shareAmount` is what that person owes for the expense. `NULL` only on rows written before v5, which are read as an equal split.
+- Indexes: `expenses(groupId)`, `settlements(groupId)`.
+
+### Migration history
+
+| Version | Change |
+|---|---|
+| v2 | `expenses` table |
+| v3 | `expense_participants` table |
+| v4 | `expenses.category`, `note`, `splitType` |
+| v5 | `expense_participants.shareAmount`; "Initial payment" rows (saved with no participants) get every group member as participant; `expense_splits` dropped (it was never written); indexes |
+
+On first launch of v1.0.1, `main.dart` also runs `UserRepository.mergeDuplicateUsers()` once (flag `duplicateUsersMerged` in SharedPreferences) to fold duplicate person rows created by older versions.
 
 ---
 
@@ -156,47 +179,51 @@ erDiagram
 
 ```mermaid
 flowchart LR
-    A["App Start"] --> B{"User exists?"}
+    A["App Start"] --> B{"Session user exists?"}
     B -->|No| C["LoginPage"]
     B -->|Yes| D["GroupsListPage"]
-    C -->|"Create profile"| D
+    C -->|"Log in by name"| D
     D -->|"Tap +"| E["CreateGroupPage"]
     E -->|"Group created"| D
-    D -->|"Tap group"| F["GroupDetailsPage"]
-    F -->|"Add Expense FAB"| G["AddExpensePage"]
+    D -->|"Tap event"| F["GroupDetailsPage"]
+    F -->|"Add Expense FAB / edit"| G["AddExpensePage"]
     G -->|"Expense saved"| F
-    D -->|"Logout"| C
+    F -->|"Insights"| H["ExpenseInsightsPage"]
+    F -->|"More → Activity history"| I["ExpenseHistoryPage"]
+    D -->|"Profile"| J["ProfilePage"]
+    D -->|"Logout (confirm)"| C
 ```
 
 ---
 
 ## 6. Core Business Logic
 
-### 6.1 Settlement Calculation Algorithm
-Located in [`group_repository.dart`](file:///home/deval/Projects/expense-splitter/lib/repositories/group_repository.dart#L328-L463) — `calculatePendingSettlements()`.
+### 6.1 One source of truth for money
+Every number on every screen comes from `lib/utils/balance_calculator.dart`, which works in whole paise internally:
 
-**Algorithm (Greedy Debt Simplification):**
-1. Initialize balance = 0 for every group member
-2. For each expense: payer gets `+(amount - share)`, each other participant gets `-share`
-3. Apply existing settlements: payer balance `+amount`, receiver balance `-amount`
-4. Separate into **creditors** (balance > 0) and **debtors** (balance < 0)
-5. Sort both descending by absolute amount
-6. Greedily match: debtor pays creditor `min(debtorOwes, creditorOwed)`
-7. Result: minimal list of settlements
+- `computeBalances(memberIds, expenses, settlements)` — for each expense the **payer is credited the full amount** and **every participant is debited their share** (the payer too, if they took part). A settlement paid from A to B adds to A and subtracts from B. Balances always sum to zero.
+- `simplifyDebts(balances)` — greedy matching of the biggest debtor with the biggest creditor; ties broken by user ID so suggestions are stable.
+- `splitEqually`, `splitByPercentages`, `fitSharesToTotal` — turn an amount into per-person shares that add up to the amount **exactly** (leftover paise go to the first / largest share).
 
-### 6.2 Expense Split Types
-- **Equal**: Amount ÷ number of selected participants
-- **Unequal**: Each participant's consumption entered manually; remainder auto-distributed to empty fields
+`GroupRepository` loads the data and calls these functions:
+- `getGroupBalances(groupId)` → used by the Events screen (`getGroupsWithBalance`, overall = sum of those), the event dashboard ("your balance"), and the Insights page.
+- `calculatePendingSettlements(groupId)` → `simplifyDebts(getGroupBalances(...))`.
 
-### 6.3 Balance Calculation
-[`getUserNetBalanceForGroup()`](file:///home/deval/Projects/expense-splitter/lib/repositories/group_repository.dart#L160-L203):
-```
-net = credit - debit - settlement_in + settlement_out
-```
-Where credit/debit come from `expense_splits` table and settlements from `settlements` table.
+Sign convention everywhere: **positive = others owe you (`+₹`, primary colour)**, **negative = you owe (`−₹`, error colour)**.
 
-> [!WARNING]
-> The `expense_splits` table is populated during group creation (initial payments) but the `addExpense()` method does NOT write to it. Balance calculation for new expenses uses the settlement algorithm directly from `expenses` + `expense_participants` tables. This is a known inconsistency in the current code.
+### 6.2 Expense split types
+Every expense is **one row** in `expenses` plus one `expense_participants` row per person with their `shareAmount`.
+- **Equal** — `addExpense(participantIds: …)` without `shares`; the repository splits it with `splitEqually`.
+- **Unequal** — the page passes `shares: {userId: amount}`; empty fields get the remainder split among them; `0` means "had nothing".
+- **Percentage** — the page converts with `splitByPercentages`; percentages must total 100.
+
+`addExpense` / `updateExpense` reject shares that do not add up to the amount. Editing reopens an expense in its own split type with its stored shares filled in.
+
+### 6.3 Identity (people)
+People are identified **by name on this device** (`findOrCreateUser` in `user_repository.dart`): case-insensitive, whitespace-normalised. A phone number only separates two people with the same name. Logging in, creating an event, and adding a member all go through it, so the same name always reaches the same events. One event cannot contain the same person twice; the profile page refuses a name another profile already uses.
+
+### 6.4 Settlements
+"Mark as paid" stores a row in `settlements` (the amount can be lowered for a partial payment). Undo = `deleteSettlement(id)` (snackbar action, or the undo icon on a completed payment).
 
 ---
 
@@ -204,178 +231,34 @@ Where credit/debit come from `expense_splits` table and settlements from `settle
 
 | Model | File | Purpose |
 |-------|------|---------|
-| `User` | `repositories/user_repository.dart:4` | App user with name, phone, timestamps |
-| `Group` | `models/group.dart:1` | Event/group with name, description, creator |
-| `GroupBalanceView` | `models/group.dart:37` | Group + calculated net balance for display |
-| `Expense` | `models/expense.dart:2` | Single expense with payer, amount, participants |
-| `ExpenseParticipant` | `models/expense.dart:105` | Join record: expense ↔ user |
-| `Settlement` | `models/settlement.dart:2` | Payment from one user to another |
-| `GroupMember` | `models/settlement.dart:88` | User + total amount paid in group |
-| `FriendInput` | `models/friend_input.dart:1` | DTO for create-group form |
-| `MemberExpenseStats` | `models/expense.dart:136` | Per-member paid/owed/net for stats |
-| `GroupExpenseStats` | `models/expense.dart:152` | Aggregate stats: count, total, categories, members |
+| `User` | `models/user.dart` | Person with name, optional phone |
+| `Group` | `models/group.dart` | Event/group with name, creator |
+| `GroupBalanceView` | `models/group.dart` | Group + current user's net balance |
+| `GroupMember` | `models/group_member.dart` | User + total amount paid in group |
+| `Expense` | `models/expense.dart` | Expense with payer, participants and `shares` |
+| `Settlement` | `models/settlement.dart` | Payment from one user to another (paid or suggested) |
+| `FriendInput` | `models/friend_input.dart` | DTO for create-group form |
+| `MemberExpenseStats` | `models/expense.dart` | Per-member paid / share / settlement-aware net |
+| `GroupExpenseStats` | `models/expense.dart` | Count, total, categories, member stats |
+| `Transfer` | `utils/balance_calculator.dart` | One suggested payment from `simplifyDebts` |
 
 ---
 
-## 8. What's Already Working ✅
+## 8. Testing
 
-- [x] User profile creation (name + optional phone)
-- [x] Session persistence via SharedPreferences
-- [x] Group creation with multiple friends + initial payments
-- [x] Group list with per-group and overall balance
-- [x] Add expense with equal or unequal split
-- [x] Expense categories and notes
-- [x] Settlement calculation (greedy debt simplification)
-- [x] Mark settlement as paid
-- [x] Expense insights: category breakdown, member net position
-- [x] Desktop support (Windows, macOS, Linux via FFI)
-- [x] Web fallback page
-- [x] Database migrations (v1 → v4)
-- [x] Clean analysis (0 issues)
+```
+test/
+├── balance_calculator_test.dart   # pure money math + ₹ formatting
+├── split_money_test.dart          # repository: balances, settlements, identity, FKs
+├── migration_test.dart            # a real v4 (v1.0.0) database upgraded to v5
+└── widget_test.dart               # login page smoke test
+```
+
+Repository tests run against a real SQLite database through `sqflite_common_ffi`.
 
 ---
 
-## 9. Remaining Features to Build 🚀
-
-Below are the features that still need to be implemented, broken into **self-contained tasks** that any small model can pick up independently.
-
----
-
-### Task 1: Edit / Delete Expense
-**Priority:** High · **Complexity:** Medium · **Files to modify:** 2-3
-
-**What:** Users need to edit or delete expenses they've added.
-
-**Steps:**
-1. Add `updateExpense()` and `deleteExpense()` methods to [`group_repository.dart`](file:///home/deval/Projects/expense-splitter/lib/repositories/group_repository.dart)
-   - `deleteExpense(String expenseId)` — Delete from `expenses` and `expense_participants` tables in a transaction
-   - `updateExpense(...)` — Delete old participants, update expense row, re-insert participants in a transaction
-2. In [`group_details_page.dart`](file:///home/deval/Projects/expense-splitter/lib/pages/group_details_page.dart), add an "Expenses" section listing all expenses with swipe-to-delete or a delete icon
-3. Add a way to navigate to [`add_expense_page.dart`](file:///home/deval/Projects/expense-splitter/lib/pages/add_expense_page.dart) in "edit mode" — pre-fill form fields from existing `Expense` object
-
-**Constraints:**
-- Use `db.transaction()` for atomicity
-- After delete/edit, call `_loadGroupData()` to refresh settlements
-
----
-
-### Task 2: Delete Group
-**Priority:** High · **Complexity:** Low · **Files to modify:** 2
-
-**What:** Users should be able to delete a group/event.
-
-**Steps:**
-1. Add `deleteGroup(String groupId)` to [`group_repository.dart`](file:///home/deval/Projects/expense-splitter/lib/repositories/group_repository.dart)
-   - In a transaction, delete from: `settlements`, `expense_participants` (via join on expenses), `expense_splits`, `expenses`, `group_members`, `groups` — in that order
-2. In [`groups_list_page.dart`](file:///home/deval/Projects/expense-splitter/lib/pages/groups_list_page.dart), add long-press or swipe-to-delete on group cards with a confirmation dialog
-3. Call `_refreshData()` after deletion
-
----
-
-### Task 3: Edit Group (Rename / Add Members)
-**Priority:** Medium · **Complexity:** Medium · **Files to modify:** 2-3
-
-**What:** Allow renaming a group and adding new members to existing groups.
-
-**Steps:**
-1. Add `updateGroupName(String groupId, String newName)` to [`group_repository.dart`](file:///home/deval/Projects/expense-splitter/lib/repositories/group_repository.dart)
-2. Add `addNewMemberToGroup(String groupId, String name, String? phone)` — creates user if needed, adds to `group_members`
-3. Create an "Edit Group" page or dialog accessible from [`group_details_page.dart`](file:///home/deval/Projects/expense-splitter/lib/pages/group_details_page.dart) via an AppBar action
-
----
-
-### Task 4: Expense History Timeline
-**Priority:** Medium · **Complexity:** Low · **Files to modify:** 1-2
-
-**What:** Show a chronological feed of all expenses and settlements in a group.
-
-**Steps:**
-1. Create a new page `lib/pages/expense_history_page.dart`
-2. Fetch expenses via `getGroupExpenses()` and settlements via `getGroupSettlements()` from [`group_repository.dart`](file:///home/deval/Projects/expense-splitter/lib/repositories/group_repository.dart)
-3. Merge and sort by `createdAt` descending
-4. Display as a `ListView` with cards showing: description, amount, payer, date, category chip
-5. Add a navigation button in [`group_details_page.dart`](file:///home/deval/Projects/expense-splitter/lib/pages/group_details_page.dart) AppBar
-
----
-
-### Task 5: User Profile Edit
-**Priority:** Low · **Complexity:** Low · **Files to modify:** 2
-
-**What:** Allow user to edit their name and phone after initial setup.
-
-**Steps:**
-1. Create `lib/pages/profile_page.dart` with form fields pre-filled from `UserRepository.getUserById()`
-2. Use existing `updateUser()` in [`user_repository.dart`](file:///home/deval/Projects/expense-splitter/lib/repositories/user_repository.dart)
-3. Add navigation from [`groups_list_page.dart`](file:///home/deval/Projects/expense-splitter/lib/pages/groups_list_page.dart) PopupMenuButton (alongside Logout)
-
----
-
-### Task 6: Currency Formatting & Locale Support
-**Priority:** Low · **Complexity:** Low · **Files to modify:** 3-5
-
-**What:** Replace hardcoded `₹` with a configurable currency symbol.
-
-**Steps:**
-1. Create `lib/utils/currency.dart` with a `formatCurrency(double amount)` function
-2. Store preferred currency in SharedPreferences
-3. Replace all `'₹${amount.toStringAsFixed(2)}'` occurrences across all pages with the utility function
-4. Add a currency selector in the profile/settings
-
----
-
-### Task 7: Dark Theme Support
-**Priority:** Low · **Complexity:** Low · **Files to modify:** 1-2
-
-**What:** Add dark mode toggle.
-
-**Steps:**
-1. In [`main.dart`](file:///home/deval/Projects/expense-splitter/lib/main.dart), add `darkTheme` and `themeMode` to `MaterialApp`
-2. Store theme preference in SharedPreferences
-3. Add toggle in PopupMenuButton on groups list page
-4. Use `ThemeData.dark()` with `ColorScheme.fromSeed(seedColor: Colors.deepPurple, brightness: Brightness.dark)`
-
----
-
-### Task 8: Export / Share Summary
-**Priority:** Low · **Complexity:** Medium · **Files to modify:** 2-3
-
-**What:** Generate a text summary of group expenses and settlements that can be shared.
-
-**Steps:**
-1. Create `lib/utils/export.dart` with `generateGroupSummary(groupId)` that builds a formatted text string
-2. Add the `share_plus` package to pubspec.yaml
-3. Add a "Share" button in [`group_details_page.dart`](file:///home/deval/Projects/expense-splitter/lib/pages/group_details_page.dart) AppBar
-4. Call `Share.share(summary)` with the generated text
-
----
-
-### Task 9: Percentage-Based Split
-**Priority:** Medium · **Complexity:** Medium · **Files to modify:** 2
-
-**What:** Add a third split type where users enter percentage contributions.
-
-**Steps:**
-1. Add `SplitType.percentage` enum in [`add_expense_page.dart`](file:///home/deval/Projects/expense-splitter/lib/pages/add_expense_page.dart)
-2. Add a new section `_buildPercentageSplitSection()` with percentage input fields per member
-3. Validate that percentages sum to 100%
-4. Convert percentages to amounts and save as individual expenses (same pattern as unequal split)
-5. Set `splitType: 'percentage'` in the database
-
----
-
-### Task 10: Search & Filter Expenses
-**Priority:** Low · **Complexity:** Low · **Files to modify:** 1-2
-
-**What:** Add search by description and filter by category on expense history.
-
-**Steps:**
-1. Add a `SearchBar` widget at the top of the expense history page (Task 4)
-2. Add category filter chips
-3. Filter the merged list client-side (no DB query changes needed since data is already loaded)
-
----
-
-## 10. Coding Conventions (For AI Models)
+## 9. Coding Conventions (For AI Models)
 
 > [!IMPORTANT]
 > Follow these conventions strictly to maintain consistency.
@@ -404,9 +287,12 @@ Below are the features that still need to be implemented, broken into **self-con
 
 ### Widget Style
 - All pages use `Scaffold` with `AppBar`
-- Cards with `BorderRadius.circular(12)`, elevation 0-2
+- Cards: radius 20 from the theme; buttons/inputs radius 16 (see `lib/theme/app_theme.dart`)
+- Colours only from `Theme.of(context).colorScheme` — no `Colors.*` outside the theme
 - Color scheme: `Theme.of(context).colorScheme`
-- Spacing: `SizedBox(height: N)` between sections (8, 12, 16, 24, 32)
+- Spacing: 8-point grid (8, 16, 24, 32)
+- Money: never do arithmetic on amounts in pages — use `balance_calculator.dart`; format with `formatCurrency` / `formatSignedCurrency`
+- After an `await`, check `if (!mounted) return;` before `setState`
 - Form validation: `GlobalKey<FormState>` + `TextFormField.validator`
 
 ### Model Patterns
@@ -500,7 +386,7 @@ class _MyPageState extends State<MyPage> {
 
 ---
 
-## 11. How to Run
+## 10. How to Run
 
 ```bash
 # Install dependencies
@@ -521,7 +407,7 @@ flutter test
 
 ---
 
-## 12. Dependencies (pubspec.yaml)
+## 11. Dependencies (pubspec.yaml)
 
 | Package | Version | Purpose |
 |---------|---------|---------|
@@ -530,71 +416,14 @@ flutter test
 | `path` | ^1.8.3 | File path utilities |
 | `shared_preferences` | ^2.2.2 | Key-value storage for user session |
 | `uuid` | ^4.0.0 | UUID v4 generation for primary keys |
+| `share_plus` | ^10.0.0 | Share the event summary |
 | `cupertino_icons` | ^1.0.8 | iOS-style icons |
 
 ---
 
-## 13. Known Issues & Technical Debt
+## 12. Known Limitations
 
-> [!NOTE]
-> These are areas where the code has inconsistencies or room for improvement.
-
-1. **`User` model is defined inside `user_repository.dart`** — should be in `models/user.dart`
-2. **`GroupMember` is defined in `settlement.dart`** — should be in its own file or `models/group.dart`
-3. **`expense_splits` table inconsistency** — the table exists and `getUserNetBalanceForGroup()` reads from it, but `addExpense()` never writes to it. The settlement calculation algorithm (`calculatePendingSettlements`) correctly uses the `expenses` + `expense_participants` tables instead.
-4. **No input validation on phone numbers** — accepts any string
-5. **No confirmation before logout** — immediately clears session
-6. **`DropdownButtonFormField` uses `initialValue`** — should use `value` property (deprecated API)
-7. **No unit tests** — `test/widget_test.dart` is the default Flutter template test
-
----
-
-## 14. Task Dependency Graph
-
-```mermaid
-flowchart TD
-    T1["Task 1: Edit/Delete Expense"]
-    T2["Task 2: Delete Group"]
-    T3["Task 3: Edit Group"]
-    T4["Task 4: Expense History"]
-    T5["Task 5: Profile Edit"]
-    T6["Task 6: Currency Formatting"]
-    T7["Task 7: Dark Theme"]
-    T8["Task 8: Export/Share"]
-    T9["Task 9: Percentage Split"]
-    T10["Task 10: Search & Filter"]
-
-    T4 --> T10
-    T4 --> T8
-
-    style T1 fill:#ff9800,color:#000
-    style T2 fill:#ff9800,color:#000
-    style T3 fill:#4caf50,color:#000
-    style T4 fill:#4caf50,color:#000
-    style T5 fill:#2196f3,color:#fff
-    style T6 fill:#2196f3,color:#fff
-    style T7 fill:#2196f3,color:#fff
-    style T8 fill:#2196f3,color:#fff
-    style T9 fill:#4caf50,color:#000
-    style T10 fill:#2196f3,color:#fff
-```
-
-**Legend:** 🟠 High priority · 🟢 Medium priority · 🔵 Low priority
-
-**Independent tasks** (can be done in any order): Tasks 1, 2, 3, 5, 6, 7, 9
-**Dependencies:** Task 10 requires Task 4 · Task 8 benefits from Task 4
-
----
-
-## 15. Recommended Task Order
-
-1. **Task 1** — Edit/Delete Expense (high impact, core CRUD)
-2. **Task 2** — Delete Group (high impact, simple)
-3. **Task 4** — Expense History Timeline (unlocks Tasks 8 & 10)
-4. **Task 3** — Edit Group
-5. **Task 9** — Percentage Split
-6. **Task 5** — Profile Edit
-7. **Task 7** — Dark Theme
-8. **Task 6** — Currency Formatting
-9. **Task 8** — Export/Share
-10. **Task 10** — Search & Filter
+1. **Local only** — no backup or sync; uninstalling the app deletes its data. Friends cannot see an event on their own phones.
+2. **Names are identities** — two different friends with the same name need different names (e.g. "Rahul K", "Rahul S") or different phone numbers.
+3. **Money is stored as `REAL`** — every amount is rounded to the paisa on write and computed in paise, but the column type is still floating point.
+4. **Release signing** — release builds use the debug key. Create a real keystore before a Play Store upload.

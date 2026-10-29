@@ -26,9 +26,10 @@ class AppDatabase {
 
       return await openDatabase(
         path,
-        version: 4,
-        onCreate: _createTables,
-        onUpgrade: _onUpgrade,
+        version: schemaVersion,
+        onConfigure: configure,
+        onCreate: createTables,
+        onUpgrade: upgrade,
         onOpen: (db) {
           debugPrint('Database opened successfully');
         },
@@ -39,7 +40,15 @@ class AppDatabase {
     }
   }
 
-  Future<void> _createTables(Database db, int version) async {
+  static const int schemaVersion = 5;
+
+  /// SQLite ignores FOREIGN KEY clauses unless this is switched on for every
+  /// connection.
+  static Future<void> configure(Database db) async {
+    await db.execute('PRAGMA foreign_keys = ON');
+  }
+
+  static Future<void> createTables(Database db, int version) async {
     // Create User table
     await db.execute('''
       CREATE TABLE users(
@@ -91,22 +100,6 @@ class AppDatabase {
       )
     ''');
 
-    // Create ExpenseSplit table (tracks who owes whom)
-    await db.execute('''
-      CREATE TABLE expense_splits(
-        id TEXT PRIMARY KEY,
-        groupId TEXT NOT NULL,
-        fromUserId TEXT NOT NULL,
-        toUserId TEXT NOT NULL,
-        amount REAL NOT NULL,
-        description TEXT,
-        createdAt INTEGER NOT NULL,
-        FOREIGN KEY (groupId) REFERENCES groups(id),
-        FOREIGN KEY (fromUserId) REFERENCES users(id),
-        FOREIGN KEY (toUserId) REFERENCES users(id)
-      )
-    ''');
-
     // Create Settlement table (tracks payments made)
     await db.execute('''
       CREATE TABLE settlements(
@@ -122,19 +115,37 @@ class AppDatabase {
       )
     ''');
 
-    // Create ExpenseParticipants table (tracks who participated in each expense)
+    // Create ExpenseParticipants table (who took part in each expense and
+    // what they owe; shareAmount NULL = equal split, used by pre-v5 rows)
     await db.execute('''
       CREATE TABLE expense_participants(
         expenseId TEXT NOT NULL,
         userId TEXT NOT NULL,
+        shareAmount REAL,
         FOREIGN KEY (expenseId) REFERENCES expenses(id),
         FOREIGN KEY (userId) REFERENCES users(id),
         PRIMARY KEY (expenseId, userId)
       )
     ''');
+
+    await _createIndexes(db);
   }
 
-  Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
+  /// Every screen loads a group's expenses and settlements by groupId.
+  static Future<void> _createIndexes(Database db) async {
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_expenses_group ON expenses(groupId)',
+    );
+    await db.execute(
+      'CREATE INDEX IF NOT EXISTS idx_settlements_group ON settlements(groupId)',
+    );
+  }
+
+  static Future<void> upgrade(
+    Database db,
+    int oldVersion,
+    int newVersion,
+  ) async {
     if (oldVersion < 2) {
       // Add expenses table for version 2
       await db.execute('''
@@ -178,6 +189,33 @@ class AppDatabase {
       );
       debugPrint(
         'Database upgraded to version 4: expense metadata columns added',
+      );
+    }
+
+    if (oldVersion < 5) {
+      // Per-person shares, so an unequal/percentage split is one expense.
+      await db.execute(
+        'ALTER TABLE expense_participants ADD COLUMN shareAmount REAL',
+      );
+
+      // "Initial payment" rows were saved with no participants, so nobody
+      // ever owed anything for them. Split them among the event's members.
+      await db.execute('''
+        INSERT INTO expense_participants (expenseId, userId)
+        SELECT e.id, gm.userId
+        FROM expenses e
+        INNER JOIN group_members gm ON gm.groupId = e.groupId
+        WHERE NOT EXISTS (
+          SELECT 1 FROM expense_participants ep WHERE ep.expenseId = e.id
+        )
+      ''');
+
+      // Never written by the app; balances come from expenses + settlements.
+      await db.execute('DROP TABLE IF EXISTS expense_splits');
+      await _createIndexes(db);
+      debugPrint(
+        'Database upgraded to version 5: per-person shares, '
+        'initial payments split, expense_splits dropped',
       );
     }
   }

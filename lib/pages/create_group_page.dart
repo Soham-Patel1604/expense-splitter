@@ -20,7 +20,7 @@ class _CreateGroupPageState extends State<CreateGroupPage> {
 
   late GroupRepository _groupRepository;
   late UserRepository _userRepository;
-  late String _currentUserId;
+  String? _currentUserId;
   String? _currentUserName;
 
   final List<FriendInput> _friends = [];
@@ -51,6 +51,7 @@ class _CreateGroupPageState extends State<CreateGroupPage> {
       if (userId != null) {
         _currentUserId = userId;
         final user = await _userRepository.getUserById(userId);
+        if (!mounted) return;
         setState(() {
           _currentUserName = user?.name ?? 'You';
         });
@@ -58,6 +59,20 @@ class _CreateGroupPageState extends State<CreateGroupPage> {
     } catch (e) {
       debugPrint('Error loading current user: $e');
     }
+  }
+
+  /// Why [name] can't be added, or null if it can. People are matched by
+  /// name, so the same name twice would be the same person twice.
+  String? _duplicateFriendError(String name) {
+    final key = normalizeName(name).toLowerCase();
+    if (_currentUserName != null &&
+        normalizeName(_currentUserName!).toLowerCase() == key) {
+      return "That's you — you're already in this event";
+    }
+    if (_friends.any((f) => normalizeName(f.name).toLowerCase() == key)) {
+      return '${normalizeName(name)} is already added';
+    }
+    return null;
   }
 
   Future<void> _showAddFriendDialog() async {
@@ -85,7 +100,7 @@ class _CreateGroupPageState extends State<CreateGroupPage> {
                   if (value == null || value.trim().isEmpty) {
                     return 'Name is required';
                   }
-                  return null;
+                  return _duplicateFriendError(value);
                 },
                 textCapitalization: TextCapitalization.words,
               ),
@@ -135,7 +150,7 @@ class _CreateGroupPageState extends State<CreateGroupPage> {
                     : double.parse(amountController.text.trim());
 
                 final friend = FriendInput(
-                  name: nameController.text.trim(),
+                  name: normalizeName(nameController.text),
                   phone: phoneController.text.trim().isEmpty
                       ? null
                       : phoneController.text.trim(),
@@ -151,7 +166,11 @@ class _CreateGroupPageState extends State<CreateGroupPage> {
       ),
     );
 
-    if (result != null) {
+    nameController.dispose();
+    phoneController.dispose();
+    amountController.dispose();
+
+    if (result != null && mounted) {
       setState(() {
         _friends.add(result);
       });
@@ -210,7 +229,9 @@ class _CreateGroupPageState extends State<CreateGroupPage> {
       ),
     );
 
-    if (result != null) {
+    amountController.dispose();
+
+    if (result != null && mounted) {
       setState(() {
         _creatorAmountPaid = result;
       });
@@ -228,6 +249,14 @@ class _CreateGroupPageState extends State<CreateGroupPage> {
       return;
     }
 
+    final currentUserId = _currentUserId;
+    if (currentUserId == null) {
+      setState(() {
+        _errorMessage = 'Your profile is still loading — try again.';
+      });
+      return;
+    }
+
     setState(() {
       _isLoading = true;
       _errorMessage = null;
@@ -236,7 +265,7 @@ class _CreateGroupPageState extends State<CreateGroupPage> {
     try {
       await _groupRepository.createGroupWithMembers(
         name: _eventNameController.text.trim(),
-        currentUserId: _currentUserId,
+        currentUserId: currentUserId,
         friends: _friends,
         creatorAmountPaid: _creatorAmountPaid,
       );
@@ -245,8 +274,10 @@ class _CreateGroupPageState extends State<CreateGroupPage> {
         Navigator.of(context).pop(true); // Signal that group was created
       }
     } catch (e) {
+      if (!mounted) return;
       setState(() {
-        _errorMessage = 'Failed to create event: ${e.toString()}';
+        _errorMessage =
+            'Failed to create event: ${e.toString().replaceAll('Exception: ', '')}';
         _isLoading = false;
       });
     }
@@ -321,6 +352,12 @@ class _CreateGroupPageState extends State<CreateGroupPage> {
                       ],
                     ),
                   ],
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Anything paid now is split equally among everyone in the '
+                  'event. Add other expenses from the event page.',
+                  style: textTheme.labelMedium,
                 ),
                 const SizedBox(height: 16),
 

@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../database/database.dart';
+import '../models/user.dart';
 import '../repositories/user_repository.dart';
-import '../utils/currency.dart';
 import '../theme/app_theme.dart';
 
 class ProfilePage extends StatefulWidget {
@@ -22,7 +22,6 @@ class _ProfilePageState extends State<ProfilePage> {
   bool _isLoading = true;
   bool _isSaving = false;
   String? _errorMessage;
-  String _currencySymbol = defaultCurrencySymbol;
 
   @override
   void initState() {
@@ -58,6 +57,7 @@ class _ProfilePageState extends State<ProfilePage> {
       }
 
       final user = await _userRepository.getUserById(currentUserId);
+      if (!mounted) return;
 
       if (user == null) {
         setState(() {
@@ -67,8 +67,6 @@ class _ProfilePageState extends State<ProfilePage> {
         return;
       }
 
-      _currencySymbol = await getCurrencySymbol();
-
       setState(() {
         _currentUser = user;
         _nameController.text = user.name;
@@ -76,6 +74,7 @@ class _ProfilePageState extends State<ProfilePage> {
         _isLoading = false;
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _errorMessage = 'Failed to load profile: ${e.toString()}';
         _isLoading = false;
@@ -94,8 +93,22 @@ class _ProfilePageState extends State<ProfilePage> {
     });
 
     try {
-      final updatedName = _nameController.text.trim();
+      final updatedName = normalizeName(_nameController.text);
       final updatedPhone = _phoneController.text.trim();
+
+      // Names identify people on this device, so two profiles can't share one.
+      if (await _userRepository.isNameTaken(
+        updatedName,
+        excludingUserId: _currentUser!.id,
+      )) {
+        if (!mounted) return;
+        setState(() {
+          _errorMessage =
+              '"$updatedName" is already used by someone else on this device.';
+          _isSaving = false;
+        });
+        return;
+      }
 
       final updatedUser = User(
         id: _currentUser!.id,
@@ -125,16 +138,12 @@ class _ProfilePageState extends State<ProfilePage> {
         Navigator.of(context).pop(true);
       }
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _errorMessage = 'Failed to update profile: ${e.toString()}';
         _isSaving = false;
       });
     }
-  }
-
-  Future<void> _selectCurrency(String symbol) async {
-    setState(() => _currencySymbol = symbol);
-    await setCurrencySymbol(symbol);
   }
 
   String _formatDate(int timestamp) {
@@ -205,7 +214,7 @@ class _ProfilePageState extends State<ProfilePage> {
             Text('Edit Profile', style: textTheme.displayLarge),
             const SizedBox(height: 8),
             Text(
-              'Update your details and choose how amounts are shown.',
+              'Update your name and phone number.',
               style: textTheme.bodyMedium,
             ),
             const SizedBox(height: 24),
@@ -300,30 +309,6 @@ class _ProfilePageState extends State<ProfilePage> {
               ),
               keyboardType: TextInputType.phone,
               enabled: !_isSaving,
-            ),
-            const SizedBox(height: 24),
-
-            // Currency section — heading in the sibling page's idiom, chips
-            // styled entirely by the global ChipTheme (selected =
-            // primaryContainer).
-            Text('Currency Symbol', style: textTheme.titleMedium),
-            const SizedBox(height: 8),
-            Text(
-              'Used for every amount shown in the app.',
-              style: textTheme.labelMedium,
-            ),
-            const SizedBox(height: 16),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                for (final symbol in supportedCurrencySymbols)
-                  ChoiceChip(
-                    label: Text(symbol),
-                    selected: _currencySymbol == symbol,
-                    onSelected: (_) => _selectCurrency(symbol),
-                  ),
-              ],
             ),
             const SizedBox(height: 24),
 

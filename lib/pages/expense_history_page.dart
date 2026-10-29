@@ -86,11 +86,13 @@ class _ExpenseHistoryPageState extends State<ExpenseHistoryPage> {
       // 3. Sort chronologically descending (most recent first)
       combined.sort((a, b) => b.timestamp.compareTo(a.timestamp));
 
+      if (!mounted) return;
       setState(() {
         _entries = combined;
         _isLoading = false;
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _errorMessage = 'Failed to load history: ${e.toString()}';
         _isLoading = false;

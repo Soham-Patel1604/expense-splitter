@@ -11,6 +11,10 @@ class Expense {
   final String paidByUserName;
   final List<String> participantIds;
   final List<String> participantNames;
+
+  /// What each participant owes for this expense, keyed by user ID.
+  /// Always sums to [amount].
+  final Map<String, double> shares;
   final int createdAt;
 
   Expense({
@@ -25,6 +29,7 @@ class Expense {
     required this.paidByUserName,
     required this.participantIds,
     required this.participantNames,
+    required this.shares,
     required this.createdAt,
   });
 
@@ -47,6 +52,7 @@ class Expense {
     String paidByName,
     List<String> participantIds,
     List<String> participantNames,
+    Map<String, double> shares,
   ) {
     return Expense(
       id: map['id'] as String,
@@ -60,15 +66,13 @@ class Expense {
       paidByUserName: paidByName,
       participantIds: participantIds,
       participantNames: participantNames,
+      shares: shares,
       createdAt: map['createdAt'] as int,
     );
   }
 
-  /// Calculate share per participant
-  double get sharePerParticipant {
-    if (participantIds.isEmpty) return 0.0;
-    return amount / participantIds.length;
-  }
+  /// What [userId] owes for this expense (0 if they did not take part).
+  double shareOf(String userId) => shares[userId] ?? 0.0;
 
   Expense copyWith({
     String? id,
@@ -82,6 +86,7 @@ class Expense {
     String? paidByUserName,
     List<String>? participantIds,
     List<String>? participantNames,
+    Map<String, double>? shares,
     int? createdAt,
   }) {
     return Expense(
@@ -96,26 +101,8 @@ class Expense {
       paidByUserName: paidByUserName ?? this.paidByUserName,
       participantIds: participantIds ?? this.participantIds,
       participantNames: participantNames ?? this.participantNames,
+      shares: shares ?? this.shares,
       createdAt: createdAt ?? this.createdAt,
-    );
-  }
-}
-
-/// Model for representing an expense participant
-class ExpenseParticipant {
-  final String expenseId;
-  final String userId;
-
-  ExpenseParticipant({required this.expenseId, required this.userId});
-
-  Map<String, dynamic> toMap() {
-    return {'expenseId': expenseId, 'userId': userId};
-  }
-
-  factory ExpenseParticipant.fromMap(Map<String, dynamic> map) {
-    return ExpenseParticipant(
-      expenseId: map['expenseId'] as String,
-      userId: map['userId'] as String,
     );
   }
 }
@@ -139,14 +126,17 @@ class MemberExpenseStats {
   final double amountPaid;
   final double amountOwed;
 
+  /// Paid minus owed, adjusted for settlements already marked as paid —
+  /// the same number the Settle tab works from.
+  final double netBalance;
+
   MemberExpenseStats({
     required this.userId,
     required this.userName,
     required this.amountPaid,
     required this.amountOwed,
+    required this.netBalance,
   });
-
-  double get netBalance => amountPaid - amountOwed;
 }
 
 class GroupExpenseStats {

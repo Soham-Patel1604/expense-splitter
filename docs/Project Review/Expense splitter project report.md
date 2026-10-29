@@ -300,3 +300,56 @@ APK out of git, `logo.png`, final `applicationId` + release keystore, VS Code ta
 - All findings come from reading the source. **`flutter analyze` and `flutter test` were not run**, because the project has no `.dart_tool/` yet and running them would trigger `pub get` and write into the project. We can run them as the first step once changes are approved.
 - Claims about "zero callers" or "never written" were checked with grep across `lib/` and `test/`.
 - Line numbers refer to commit `6c267bf`.
+
+---
+
+## 11. Status after v1.0.1 (2026-10-29)
+
+All findings above were worked on for v1.0.1. `flutter analyze`: no issues. `flutter test`: 30 tests pass, including a real upgrade of a v1.0.0 database.
+
+**One more root cause of bug #5 turned up during the fix.** The old settlement algorithm credited the payer **only if the payer was also a participant**. Unequal and percentage splits were stored as one row per person, so the payer was never credited for anyone else's share. A friend's −₹250 had no matching +₹250, so no settlement was generated and the app showed "All settled". The new `computeBalances()` always credits the payer the full amount.
+
+### Reported bugs
+
+| Bug | Status | What changed |
+|---|---|---|
+| #1 Button hides numbers | ✅ Fixed | 96 px bottom padding on Home, Settle and Expenses; the FAB is hidden on the More tab |
+| #2 Insights on another page | ✅ Fixed | New `ExpenseInsightsPage` (AppBar icon, More tab, "your balance" card). Event page has 3 tabs |
+| #3 Same name after logout shows old events | ✅ Fixed | Login reuses the profile by name; friends are matched by name too; one-time merge of old duplicate rows; logout asks for confirmation |
+| #4 Indian currency only | ✅ Fixed | Picker removed; `₹` with Indian grouping (`₹1,23,456.00`) everywhere |
+| #5 Shows "All settled" while money is owed; +/− wrong | ✅ Fixed | One balance function for every screen; payer always credited; initial payments split; "You owe −₹" / "owes you +₹" wording |
+| #6 New entry in an old event not reflected | ✅ Fixed (likely cause) | The Home screen now reads the same balances as the event page; the same friend is one person across events |
+
+### Other findings
+
+| # | Status |
+|---|---|
+| E1 home balance from empty table | ✅ `expense_splits` dropped; Home uses `computeBalances` |
+| E2 initial payments not split | ✅ Split among all members (new events + v5 migration of old ones) |
+| E3 edit + switch split type | ✅ Edit reopens in its own split type with stored shares; saves real shares |
+| E4 unequal/% saved as N rows | ✅ One expense with per-person `shareAmount`, one transaction |
+| E5 stats ignore settlements | ✅ Insights net = Settle tab balances |
+| E6 / E7 duplicate users, login identity | ✅ `findOrCreateUser` + `mergeDuplicateUsers`; duplicates and self-add blocked |
+| E8 float money | ✅ Computed in paise, shares always sum exactly. Column type still `REAL` |
+| E9 foreign keys not enforced | ✅ `PRAGMA foreign_keys = ON` |
+| E10 stale unequal amount | ✅ Reset on every validation; invalid input is reported |
+| E11 misleading "per person" | ✅ Dashboard shows *your* balance; Insights shows "Average per member" |
+| E12 no undo / partial payment | ✅ Partial amount in the confirm dialog; Undo snackbar + undo icon |
+| E13 `setState` without `mounted` | ✅ Guards added on all pages |
+| E14 N+1 queries | ✅ Expenses in 2 queries, members and counts in 1; indexes on `groupId` |
+| E15 no backup/restore | ❌ Not done. It's a new feature; needs a decision on where backups go |
+| P3 cleanup | ✅ Dead code removed, `User`/`GroupMember` in their own model files, quote fix, controllers disposed |
+
+### Repository and release
+
+| Item | Status |
+|---|---|
+| APK in git | ✅ `*.apk` git-ignored. v1.0.0's APK is still tracked; untracking it needs a commit (not done) |
+| `logo.png` missing | ✅ Restored from commit `03df330` |
+| `applicationId` | ✅ `com.expensesplitter.app`, so v1.0.1 installs alongside v1.0.0 |
+| Release keystore | ❌ Not created. Still debug-signed; decide who owns the keystore before the Play Store |
+| Version | ✅ `1.0.1+2` |
+| README / ARCHITECTURE | ✅ Updated |
+| VS Code auto-run `npx @penpot/mcp@beta` | ✅ No longer runs on folder open; `npx` auto-approve removed |
+| `web_entrypoint.dart` | ✅ Removed (unused) |
+| Cross-device sync | ❌ Out of scope (needs a backend) |

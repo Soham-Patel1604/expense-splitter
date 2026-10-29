@@ -23,8 +23,7 @@ class _GroupsListPageState extends State<GroupsListPage> {
   String? _currentUserId; // Make nullable to handle loading state
   int _refreshKey = 0; // Add refresh key to trigger rebuilds
   // Cached so plain rebuilds (theme change, popups) don't re-run the queries —
-  // only _refreshData() invalidates it. The member-count loop inside makes
-  // each run cost N+1 local queries, so refetch-per-build would be wasteful.
+  // only _refreshData() invalidates it.
   Future<_HomeData>? _homeFuture;
 
   @override
@@ -39,7 +38,7 @@ class _GroupsListPageState extends State<GroupsListPage> {
     try {
       final prefs = await SharedPreferences.getInstance();
       final userId = prefs.getString('currentUserId');
-      if (userId != null) {
+      if (userId != null && mounted) {
         setState(() {
           _currentUserId = userId;
         });
@@ -50,6 +49,28 @@ class _GroupsListPageState extends State<GroupsListPage> {
   }
 
   Future<void> _handleLogout() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Log out?'),
+        content: const Text(
+          'Your events stay on this device. Log in with the same name to see '
+          'them again.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Log out'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('currentUserId');
 
@@ -74,8 +95,7 @@ class _GroupsListPageState extends State<GroupsListPage> {
       MaterialPageRoute(builder: (context) => const ProfilePage()),
     );
 
-    // Refresh unconditionally: Profile can persist changes (e.g. currency)
-    // without popping true.
+    // Refresh unconditionally so a renamed profile shows up straight away.
     _refreshData();
   }
 
@@ -137,28 +157,22 @@ class _GroupsListPageState extends State<GroupsListPage> {
     }
   }
 
-  /// Loads everything the home screen renders in one go, so the balance hero
-  /// and the event cards always agree and arrive together.
+  /// Loads everything the home screen renders in one go. The overall balance
+  /// is the sum of the per-event balances, so the hero and the event cards
+  /// always agree.
   Future<_HomeData> _loadHomeData(String userId) async {
-    // Both futures are kicked off before either is awaited so the queries
-    // overlap instead of stacking.
-    final overallFuture = _groupRepository.getOverallNetBalance(userId);
-    final groupsFuture = _groupRepository.getGroupsWithBalance(userId);
+    final groups = await _groupRepository.getGroupsWithBalance(userId);
+    final overallBalance = groups.fold<double>(
+      0.0,
+      (sum, view) => sum + view.netBalance,
+    );
 
-    final overallBalance = await overallFuture;
-    final groups = await groupsFuture;
-
-    final memberCounts = <String, int>{};
-    for (final view in groups) {
-      try {
-        final members = await _groupRepository.getGroupMembersWithPayments(
-          view.group.id,
-        );
-        memberCounts[view.group.id] = members.length;
-      } catch (e) {
-        // A missing count only hides a meta line — never break the list.
-        debugPrint('Error loading member count: $e');
-      }
+    var memberCounts = <String, int>{};
+    try {
+      memberCounts = await _groupRepository.getMemberCountsForUser(userId);
+    } catch (e) {
+      // A missing count only hides a meta line — never break the list.
+      debugPrint('Error loading member counts: $e');
     }
 
     return _HomeData(
@@ -327,7 +341,9 @@ class _GroupsListPageState extends State<GroupsListPage> {
 
           return SingleChildScrollView(
             child: Padding(
-              padding: const EdgeInsets.all(16),
+              // Extra bottom space so the + button never covers the last
+              // event's balance.
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 96),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -515,11 +531,11 @@ class _GroupsListPageState extends State<GroupsListPage> {
     if (isOwed) {
       background = colorScheme.primaryContainer;
       foreground = colorScheme.onPrimaryContainer;
-      label = '+${formatCurrency(balance)}';
+      label = formatSignedCurrency(balance);
     } else if (isOwing) {
       background = colorScheme.errorContainer;
       foreground = colorScheme.onErrorContainer;
-      label = '-${formatCurrency(-balance)}';
+      label = formatSignedCurrency(balance);
     } else {
       background = colorScheme.surfaceContainerHighest;
       foreground = colorScheme.onSurfaceVariant;

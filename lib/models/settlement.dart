@@ -41,7 +41,7 @@ class Settlement {
       fromUserName: fromName,
       toUserId: map['toUserId'] as String,
       toUserName: toName,
-      amount: map['amount'] as double,
+      amount: (map['amount'] as num).toDouble(),
       isPaid: true, // settlements in database are paid
       paidAt: map['createdAt'] as int?,
     );
@@ -82,17 +82,4 @@ class Settlement {
       paidAt: paidAt ?? this.paidAt,
     );
   }
-}
-
-/// Model representing a member in a group with their payment details
-class GroupMember {
-  final String userId;
-  final String userName;
-  final double amountPaid;
-
-  GroupMember({
-    required this.userId,
-    required this.userName,
-    required this.amountPaid,
-  });
 }

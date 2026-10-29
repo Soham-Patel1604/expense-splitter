@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../models/expense.dart';
 import '../models/group.dart';
-import '../models/settlement.dart';
+import '../models/group_member.dart';
 import '../database/database.dart';
 import '../repositories/group_repository.dart';
+import '../utils/balance_calculator.dart';
 import '../utils/currency.dart';
 
 enum SplitType { equal, unequal, percentage }
@@ -90,13 +92,13 @@ class _AddExpensePageState extends State<AddExpensePage> {
       _noteController.text = exp.note ?? '';
       _selectedCategory = exp.category;
       _selectedPayerId = exp.paidByUserId;
-      // Percentage-split expenses are stored as one single-participant row
-      // per member, so opening them as Equal (amount + participant unchanged)
-      // is mathematically identical and avoids losing the original shares.
-      // Unequal rows are stored the same way: a single row cannot represent
-      // a multi-member unequal split (updateExpense writes one row), so
-      // opening them as Equal with only that member checked is money-identical.
-      _splitType = SplitType.equal;
+      // Every expense stores each person's share, so it reopens in the split
+      // it was saved with (the share fields are filled in once members load).
+      _splitType = switch (exp.splitType) {
+        'unequal' => SplitType.unequal,
+        'percentage' => SplitType.percentage,
+        _ => SplitType.equal,
+      };
       _selectedParticipants = exp.participantIds.toSet();
     }
 
@@ -127,7 +129,10 @@ class _AddExpensePageState extends State<AddExpensePage> {
       final members = await _groupRepository.getGroupMembersWithPayments(
         widget.groupBalanceView.group.id,
       );
+      final prefs = await SharedPreferences.getInstance();
+      final currentUserId = prefs.getString('currentUserId');
 
+      if (!mounted) return;
       setState(() {
         _members = members;
         if (widget.existingExpense != null) {
@@ -135,9 +140,12 @@ class _AddExpensePageState extends State<AddExpensePage> {
           _selectedPayerId = exp.paidByUserId;
           _selectedParticipants = exp.participantIds.toSet();
         } else {
-          // Default: select first member as payer
+          // Default payer: you (falls back to the first member)
           if (_members.isNotEmpty) {
-            _selectedPayerId = _members.first.userId;
+            _selectedPayerId =
+                _members.any((m) => m.userId == currentUserId)
+                ? currentUserId
+                : _members.first.userId;
           }
           // Default: all members selected as participants for equal split
           _selectedParticipants = _members.map((m) => m.userId).toSet();
@@ -157,14 +165,51 @@ class _AddExpensePageState extends State<AddExpensePage> {
             )
             .toList();
 
+        _prefillShares();
+
         _isLoading = false;
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _errorMessage = 'Failed to load members: ${e.toString()}';
         _isLoading = false;
       });
     }
+  }
+
+  /// When editing, fill the unequal / percentage fields from the stored
+  /// shares so saving without changes keeps every share exactly as it was.
+  void _prefillShares() {
+    final exp = widget.existingExpense;
+    if (exp == null) return;
+
+    if (_splitType == SplitType.unequal) {
+      for (final c in _memberConsumptions) {
+        final share = exp.shares[c.userId];
+        if (share != null) c.controller.text = share.toStringAsFixed(2);
+      }
+    } else if (_splitType == SplitType.percentage) {
+      final rows = _memberPercentages
+          .where((p) => exp.shares.containsKey(p.userId))
+          .toList();
+      double assigned = 0;
+      for (var i = 0; i < rows.length; i++) {
+        // The last person gets whatever is left so the fields sum to 100.
+        final pct = i == rows.length - 1
+            ? 100 - assigned
+            : (exp.shares[rows[i].userId]! / exp.amount * 10000).round() / 100;
+        assigned += pct;
+        rows[i].controller.text = _formatPercent(pct);
+      }
+    }
+  }
+
+  String _formatPercent(double value) {
+    final rounded = (value * 100).round() / 100;
+    return rounded == rounded.roundToDouble()
+        ? rounded.toStringAsFixed(0)
+        : rounded.toStringAsFixed(2);
   }
 
   void _toggleParticipant(String userId) {
@@ -200,16 +245,25 @@ class _AddExpensePageState extends State<AddExpensePage> {
     int emptyCount = 0;
 
     for (var consumption in _memberConsumptions) {
+      // Reset first so a value from an earlier attempt can never leak in.
+      consumption.amount = null;
       final text = consumption.controller.text.trim();
-      if (text.isNotEmpty) {
-        final amount = double.tryParse(text);
-        if (amount != null && amount > 0) {
-          enteredSum += amount;
-          consumption.amount = amount;
-        }
-      } else {
+      if (text.isEmpty) {
         emptyCount++;
-        consumption.amount = null;
+        continue;
+      }
+
+      final amount = double.tryParse(text);
+      if (amount == null || amount < 0) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Invalid amount for ${consumption.userName}')),
+        );
+        return false;
+      }
+      // 0 means "had nothing": excluded, and not auto-filled either.
+      if (amount > 0) {
+        enteredSum += amount;
+        consumption.amount = amount;
       }
     }
 
@@ -293,6 +347,15 @@ class _AddExpensePageState extends State<AddExpensePage> {
       return false;
     }
 
+    if (!_memberPercentages.any((p) => (p.percentage ?? 0) > 0)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Enter a percentage for at least one person'),
+        ),
+      );
+      return false;
+    }
+
     return true;
   }
 
@@ -354,83 +417,47 @@ class _AddExpensePageState extends State<AddExpensePage> {
       final expenseDescription = description.isEmpty ? 'Expense' : description;
       final expenseNote = note.isEmpty ? null : note;
 
-      if (widget.existingExpense != null) {
-        // Update existing expense
-        final participantIds = _splitType == SplitType.equal
-            ? _selectedParticipants.toList()
-            : _splitType == SplitType.percentage
-            ? _memberPercentages
-                  .where((p) => (p.percentage ?? 0) > 0)
-                  .map((p) => p.userId)
-                  .toList()
-            : _memberConsumptions
-                  .where((c) => (c.amount ?? 0) > 0)
-                  .map((c) => c.userId)
-                  .toList();
+      // One expense row whatever the split; unequal / percentage carry the
+      // exact share of each person, equal is split by the repository.
+      final Map<String, double>? shares = switch (_splitType) {
+        SplitType.equal => null,
+        SplitType.unequal => {
+          for (final c in _memberConsumptions)
+            if ((c.amount ?? 0) > 0) c.userId: c.amount!,
+        },
+        SplitType.percentage => splitByPercentages(amount, {
+          for (final p in _memberPercentages)
+            if ((p.percentage ?? 0) > 0) p.userId: p.percentage!,
+        }),
+      };
+      final participantIds = shares?.keys.toList() ??
+          _selectedParticipants.toList();
+      final splitType = _splitType.name;
 
+      if (widget.existingExpense != null) {
         await _groupRepository.updateExpense(
           expenseId: widget.existingExpense!.id,
           description: expenseDescription,
           amount: amount,
           paidByUserId: _selectedPayerId!,
           participantIds: participantIds,
+          shares: shares,
           category: _selectedCategory,
           note: expenseNote,
-          splitType: _splitType == SplitType.equal
-              ? 'equal'
-              : _splitType == SplitType.percentage
-              ? 'percentage'
-              : 'unequal',
+          splitType: splitType,
         );
       } else {
-        if (_splitType == SplitType.equal) {
-          // Equal split - single expense with selected participants
-          await _groupRepository.addExpense(
-            groupId: widget.groupBalanceView.group.id,
-            description: expenseDescription,
-            amount: amount,
-            paidByUserId: _selectedPayerId!,
-            participantIds: _selectedParticipants.toList(),
-            category: _selectedCategory,
-            note: expenseNote,
-            splitType: 'equal',
-          );
-        } else if (_splitType == SplitType.unequal) {
-          // Unequal split - create individual expenses for each person's consumption
-          // This allows the smart settlement merge to work correctly
-          for (var consumption in _memberConsumptions) {
-            if (consumption.amount != null && consumption.amount! > 0) {
-              await _groupRepository.addExpense(
-                groupId: widget.groupBalanceView.group.id,
-                description: '$expenseDescription - ${consumption.userName}',
-                amount: consumption.amount!,
-                paidByUserId: _selectedPayerId!,
-                participantIds: [consumption.userId],
-                category: _selectedCategory,
-                note: expenseNote,
-                splitType: 'unequal',
-              );
-            }
-          }
-        } else if (_splitType == SplitType.percentage) {
-          // Percentage split - convert percentage to amount for each member,
-          // one individual expense per member (same pattern as unequal split)
-          for (var p in _memberPercentages) {
-            if (p.percentage != null && p.percentage! > 0) {
-              final memberAmount = amount * (p.percentage! / 100.0);
-              await _groupRepository.addExpense(
-                groupId: widget.groupBalanceView.group.id,
-                description: '$expenseDescription - ${p.userName}',
-                amount: memberAmount,
-                paidByUserId: _selectedPayerId!,
-                participantIds: [p.userId],
-                category: _selectedCategory,
-                note: expenseNote,
-                splitType: 'percentage',
-              );
-            }
-          }
-        }
+        await _groupRepository.addExpense(
+          groupId: widget.groupBalanceView.group.id,
+          description: expenseDescription,
+          amount: amount,
+          paidByUserId: _selectedPayerId!,
+          participantIds: participantIds,
+          shares: shares,
+          category: _selectedCategory,
+          note: expenseNote,
+          splitType: splitType,
+        );
       }
 
       if (mounted) {
@@ -442,7 +469,7 @@ class _AddExpensePageState extends State<AddExpensePage> {
               children: [
                 Icon(
                   Icons.check_circle,
-                  color: Theme.of(context).colorScheme.primary,
+                  color: Theme.of(context).colorScheme.onInverseSurface,
                 ),
                 const SizedBox(width: 8),
                 Text(
@@ -460,15 +487,14 @@ class _AddExpensePageState extends State<AddExpensePage> {
         Navigator.of(context).pop(true);
       }
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _isSaving = false;
       });
 
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Error: ${e.toString()}')));
-      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Error: ${e.toString()}')));
     }
   }
 

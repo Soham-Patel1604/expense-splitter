@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../models/expense.dart';
 import '../models/group.dart';
+import '../models/group_member.dart';
 import '../models/settlement.dart';
 import '../database/database.dart';
 import '../repositories/group_repository.dart';
@@ -9,6 +11,7 @@ import '../utils/currency.dart';
 import '../utils/export.dart';
 import 'add_expense_page.dart';
 import 'expense_history_page.dart';
+import 'expense_insights_page.dart';
 
 class GroupDetailsPage extends StatefulWidget {
   final GroupBalanceView groupBalanceView;
@@ -26,12 +29,14 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
   List<Expense> _expenses = [];
   List<Settlement> _pendingSettlements = [];
   List<Settlement> _completedSettlements = [];
-  GroupExpenseStats? _stats;
+  String? _currentUserId;
+  double _myBalance = 0.0;
   bool _isLoading = true;
   String? _errorMessage;
 
-  // Which of the 4 bottom tabs is visible (Settle / Expenses / Stats / More).
+  // Which of the 3 bottom tabs is visible (Settle / Expenses / More).
   int _tabIndex = 0;
+  static const int _moreTabIndex = 2;
 
   @override
   void initState() {
@@ -49,48 +54,47 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
     });
 
     try {
+      final groupId = widget.groupBalanceView.group.id;
+      final prefs = await SharedPreferences.getInstance();
+      final currentUserId = prefs.getString('currentUserId');
+
       // Load members with their payments
       final members = await _groupRepository.getGroupMembersWithPayments(
-        widget.groupBalanceView.group.id,
+        groupId,
       );
 
       // Load all logged expenses
-      final expenses = await _groupRepository.getGroupExpenses(
-        widget.groupBalanceView.group.id,
-      );
+      final expenses = await _groupRepository.getGroupExpenses(groupId);
 
       // Load pending settlements
       final pending = await _groupRepository.calculatePendingSettlements(
-        widget.groupBalanceView.group.id,
+        groupId,
       );
 
       // Load completed settlements
-      final completed = await _groupRepository.getGroupSettlements(
-        widget.groupBalanceView.group.id,
-      );
+      final completed = await _groupRepository.getGroupSettlements(groupId);
 
-      // Load stats summary for this group
-      final stats = await _groupRepository.getGroupExpenseStats(
-        widget.groupBalanceView.group.id,
-      );
+      // Your own position — the same number the Events screen shows
+      final balances = await _groupRepository.getGroupBalances(groupId);
 
       // Load the group itself so renames are reflected
-      final group = await _groupRepository.getGroupById(
-        widget.groupBalanceView.group.id,
-      );
+      final group = await _groupRepository.getGroupById(groupId);
 
+      if (!mounted) return;
       setState(() {
         if (group != null) {
           _groupName = group.name;
         }
+        _currentUserId = currentUserId;
         _members = members;
         _expenses = expenses;
         _pendingSettlements = pending;
         _completedSettlements = completed;
-        _stats = stats;
+        _myBalance = balances[currentUserId] ?? 0.0;
         _isLoading = false;
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _errorMessage = 'Failed to load group data: ${e.toString()}';
         _isLoading = false;
@@ -100,7 +104,11 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
 
   /// Shared snackbar helper — uses the theme's SnackBar (inverseSurface), so
   /// the same message reads correctly in light AND dark mode.
-  void _showSnack(String message, {bool error = false}) {
+  void _showSnack(
+    String message, {
+    bool error = false,
+    SnackBarAction? action,
+  }) {
     final scheme = Theme.of(context).colorScheme;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
@@ -111,20 +119,30 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
               color: scheme.onInverseSurface,
             ),
             const SizedBox(width: 8),
-            Text(message),
+            Expanded(child: Text(message)),
           ],
         ),
-        duration: const Duration(seconds: 2),
+        action: action,
+        duration: Duration(seconds: action != null ? 5 : 2),
       ),
     );
   }
 
-  Future<void> _markAsPaid(Settlement settlement) async {
+  Future<void> _markAsPaid(Settlement settlement, double amount) async {
     try {
-      await _groupRepository.markSettlementAsPaid(settlement);
+      final settlementId = await _groupRepository.markSettlementAsPaid(
+        settlement,
+        amount: amount,
+      );
 
       if (mounted) {
-        _showSnack('✓ Settlement marked as paid');
+        _showSnack(
+          '✓ ${formatCurrency(amount)} marked as paid',
+          action: SnackBarAction(
+            label: 'Undo',
+            onPressed: () => _undoPayment(settlementId),
+          ),
+        );
       }
 
       // Reload data to reflect changes
@@ -134,6 +152,47 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
         _showSnack('Error: ${e.toString()}', error: true);
       }
     }
+  }
+
+  Future<void> _undoPayment(String settlementId) async {
+    try {
+      await _groupRepository.deleteSettlement(settlementId);
+      if (mounted) {
+        _showSnack('Payment removed');
+      }
+      await _loadGroupData();
+    } catch (e) {
+      if (mounted) {
+        _showSnack('Error: ${e.toString()}', error: true);
+      }
+    }
+  }
+
+  void _showUndoPaymentDialog(Settlement settlement) {
+    showDialog(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Undo payment?'),
+        content: Text(
+          'Remove "${settlement.fromUserName} paid ${settlement.toUserName} '
+          '${formatCurrency(settlement.amount)}"? The amount goes back to '
+          'pending.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.of(dialogContext).pop();
+              _undoPayment(settlement.id);
+            },
+            child: const Text('Undo payment'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _shareGroupSummary() async {
@@ -501,14 +560,30 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
     });
   }
 
+  Future<void> _navigateToInsights() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (context) =>
+            ExpenseInsightsPage(groupBalanceView: widget.groupBalanceView),
+      ),
+    );
+  }
+
   // ────────────────────────── Shell: dashboard + tabs ───────────────────────
 
   @override
   Widget build(BuildContext context) {
+    final ready = !_isLoading && _errorMessage == null;
+
     return Scaffold(
       appBar: AppBar(
         title: Text(_groupName),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.insights),
+            onPressed: _navigateToInsights,
+            tooltip: 'Insights',
+          ),
           IconButton(
             icon: const Icon(Icons.refresh),
             onPressed: _loadGroupData,
@@ -555,52 +630,57 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
                     children: [
                       _settleTab(),
                       _expensesTab(),
-                      _statsTab(),
                       _moreTab(),
                     ],
                   ),
                 ),
               ],
             ),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _tabIndex,
-        onDestinationSelected: _goToTab,
-        destinations: const [
-          NavigationDestination(
-            icon: Icon(Icons.handshake_outlined),
-            selectedIcon: Icon(Icons.handshake),
-            label: 'Settle',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.receipt_long_outlined),
-            selectedIcon: Icon(Icons.receipt_long),
-            label: 'Expenses',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.insights_outlined),
-            selectedIcon: Icon(Icons.insights),
-            label: 'Stats',
-          ),
-          NavigationDestination(icon: Icon(Icons.more_horiz), label: 'More'),
-        ],
-      ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _navigateToAddExpense,
-        icon: const Icon(Icons.add),
-        label: const Text('Add Expense'),
-      ),
+      bottomNavigationBar: ready
+          ? NavigationBar(
+              selectedIndex: _tabIndex,
+              onDestinationSelected: _goToTab,
+              destinations: const [
+                NavigationDestination(
+                  icon: Icon(Icons.handshake_outlined),
+                  selectedIcon: Icon(Icons.handshake),
+                  label: 'Settle',
+                ),
+                NavigationDestination(
+                  icon: Icon(Icons.receipt_long_outlined),
+                  selectedIcon: Icon(Icons.receipt_long),
+                  label: 'Expenses',
+                ),
+                NavigationDestination(
+                  icon: Icon(Icons.more_horiz),
+                  label: 'More',
+                ),
+              ],
+            )
+          : null,
+      floatingActionButton: ready && _tabIndex != _moreTabIndex
+          ? FloatingActionButton.extended(
+              onPressed: _navigateToAddExpense,
+              icon: const Icon(Icons.add),
+              label: const Text('Add Expense'),
+            )
+          : null,
     );
   }
 
-  /// Compact always-visible dashboard: three tappable summary cards that jump
-  /// straight to the matching tab (the user asked for dashboard + tabs, together).
+  /// Compact always-visible dashboard: three tappable summary cards — total
+  /// spent, payments left, and your own position in this event.
   Widget _buildDashboardHeader() {
-    final totalPaid = _members.fold<double>(
+    final totalSpent = _expenses.fold<double>(
       0.0,
-      (sum, m) => sum + m.amountPaid,
+      (sum, e) => sum + e.amount,
     );
-    final fairShare = _members.isNotEmpty ? totalPaid / _members.length : 0.0;
     final pending = _pendingSettlements.length;
+    final myBalanceLabel = _myBalance > 0
+        ? 'you are owed'
+        : _myBalance < 0
+        ? 'you owe'
+        : 'you are square';
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
@@ -608,7 +688,7 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
         children: [
           Expanded(
             child: _dashboardCard(
-              value: formatCurrency(totalPaid),
+              value: formatCurrency(totalSpent),
               label: 'Spent',
               onTap: () => _goToTab(1),
             ),
@@ -625,9 +705,14 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
           const SizedBox(width: 8),
           Expanded(
             child: _dashboardCard(
-              value: formatCurrency(fairShare),
-              label: 'per person',
-              onTap: () => _goToTab(2),
+              value: formatSignedCurrency(_myBalance),
+              label: myBalanceLabel,
+              valueColor: _myBalance > 0
+                  ? Theme.of(context).colorScheme.primary
+                  : _myBalance < 0
+                  ? Theme.of(context).colorScheme.error
+                  : null,
+              onTap: _navigateToInsights,
             ),
           ),
         ],
@@ -640,6 +725,7 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
     required String label,
     VoidCallback? onTap,
     bool highlight = false,
+    Color? valueColor,
   }) {
     final scheme = Theme.of(context).colorScheme;
     return Card(
@@ -660,7 +746,7 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
                 child: Text(
                   value,
                   style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                    color: highlight ? scheme.onPrimaryContainer : null,
+                    color: highlight ? scheme.onPrimaryContainer : valueColor,
                   ),
                 ),
               ),
@@ -682,13 +768,17 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
 
   // ───────────────────────────── Tab 1: Settle ──────────────────────────────
 
+  /// Extra bottom space so the floating "Add Expense" button never covers the
+  /// last card's amount or buttons.
+  static const EdgeInsets _tabPadding = EdgeInsets.fromLTRB(16, 16, 16, 96);
+
   Widget _settleTab() {
     return RefreshIndicator(
       onRefresh: _loadGroupData,
       child: SingleChildScrollView(
         physics: const AlwaysScrollableScrollPhysics(),
         child: Padding(
-          padding: const EdgeInsets.all(16),
+          padding: _tabPadding,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -726,7 +816,7 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
       child: SingleChildScrollView(
         physics: const AlwaysScrollableScrollPhysics(),
         child: Padding(
-          padding: const EdgeInsets.all(16),
+          padding: _tabPadding,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -740,35 +830,19 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
     );
   }
 
-  // ──────────────────────────── Tab 3: Stats ────────────────────────────────
+  // ──────────────────────────── Tab 3: More ─────────────────────────────────
 
-  Widget _statsTab() {
-    return RefreshIndicator(
-      onRefresh: _loadGroupData,
-      child: SingleChildScrollView(
-        physics: const AlwaysScrollableScrollPhysics(),
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              _buildEventInfoCard(),
-              const SizedBox(height: 16),
-              if (_stats?.hasData ?? false) _buildStatsCard(),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  // ──────────────────────────── Tab 4: More ─────────────────────────────────
-
-  /// Share / edit / history moved out of the crowded AppBar into rows here.
+  /// Insights / share / edit / history live here instead of a crowded AppBar.
   Widget _moreTab() {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
+        ListTile(
+          leading: const Icon(Icons.insights_outlined),
+          title: const Text('Expense insights'),
+          subtitle: const Text('Totals, categories and who stands where'),
+          onTap: _navigateToInsights,
+        ),
         ListTile(
           leading: const Icon(Icons.edit_outlined),
           title: const Text('Edit event'),
@@ -786,12 +860,6 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
           title: const Text('Activity history'),
           subtitle: const Text('Every expense and payment, in order'),
           onTap: _navigateToHistory,
-        ),
-        ListTile(
-          leading: const Icon(Icons.refresh),
-          title: const Text('Refresh'),
-          subtitle: const Text('Reload this event'),
-          onTap: _loadGroupData,
         ),
       ],
     );
@@ -812,6 +880,17 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
         ),
       ),
     );
+  }
+
+  String _splitLabel(Expense expense) {
+    switch (expense.splitType) {
+      case 'unequal':
+        return 'Unequal';
+      case 'percentage':
+        return 'By %';
+      default:
+        return 'Equal';
+    }
   }
 
   Widget _buildExpensesList() {
@@ -857,9 +936,18 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
                       ),
                       const SizedBox(height: 8),
                       Text(
-                        'Category: $categoryLabel • ${expense.participantIds.length} participant${expense.participantIds.length == 1 ? '' : 's'}',
+                        'Category: $categoryLabel • ${_splitLabel(expense)} • ${expense.participantIds.length} participant${expense.participantIds.length == 1 ? '' : 's'}',
                         style: Theme.of(context).textTheme.labelMedium,
                       ),
+                      if (_currentUserId != null &&
+                          expense.shares.containsKey(_currentUserId)) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          'Your share: ${formatCurrency(expense.shareOf(_currentUserId!))}',
+                          style: Theme.of(context).textTheme.labelMedium
+                              ?.copyWith(color: scheme.primary),
+                        ),
+                      ],
                       if (expense.note != null &&
                           expense.note!.trim().isNotEmpty) ...[
                         const SizedBox(height: 8),
@@ -911,280 +999,6 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
           ),
         );
       }).toList(),
-    );
-  }
-
-  Widget _buildEventInfoCard() {
-    final scheme = Theme.of(context).colorScheme;
-    final totalAmount = _members.fold<double>(
-      0.0,
-      (sum, member) => sum + member.amountPaid,
-    );
-    final fairShare = _members.isNotEmpty ? totalAmount / _members.length : 0.0;
-
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // Event Name
-            Row(
-              children: [
-                Icon(Icons.event, color: scheme.primary, size: 24),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: Text(
-                    _groupName,
-                    style: Theme.of(context).textTheme.titleLarge,
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            const Divider(),
-            const SizedBox(height: 16),
-
-            // Total Amount
-            _buildInfoRow(
-              'Total Amount',
-              formatCurrency(totalAmount),
-              Icons.payments,
-            ),
-            const SizedBox(height: 16),
-
-            // Fair Share
-            _buildInfoRow(
-              'Per Person Share',
-              formatCurrency(fairShare),
-              Icons.person,
-            ),
-            const SizedBox(height: 16),
-
-            // Members Count
-            _buildInfoRow('Total Members', '${_members.length}', Icons.group),
-
-            // Members List
-            if (_members.isNotEmpty) ...[
-              const SizedBox(height: 16),
-              const Divider(),
-              const SizedBox(height: 16),
-              Text(
-                'Payment Details',
-                style: Theme.of(
-                  context,
-                ).textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w600),
-              ),
-              const SizedBox(height: 16),
-              ..._members.map(
-                (member) => Padding(
-                  padding: const EdgeInsets.only(bottom: 8),
-                  child: Row(
-                    children: [
-                      CircleAvatar(
-                        radius: 16,
-                        backgroundColor: member.amountPaid > 0
-                            ? scheme.primaryContainer
-                            : scheme.surfaceContainerHighest,
-                        child: Text(
-                          member.userName[0].toUpperCase(),
-                          style: TextStyle(
-                            fontSize: 13,
-                            fontWeight: FontWeight.w600,
-                            color: member.amountPaid > 0
-                                ? scheme.onPrimaryContainer
-                                : scheme.onSurfaceVariant,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 16),
-                      Expanded(
-                        child: Text(
-                          member.userName,
-                          style: Theme.of(context).textTheme.bodyMedium,
-                        ),
-                      ),
-                      Text(
-                        'Paid ${formatCurrency(member.amountPaid)}',
-                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          fontWeight: FontWeight.w600,
-                          color: member.amountPaid > 0
-                              ? scheme.primary
-                              : scheme.onSurfaceVariant,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildInfoRow(String label, String value, IconData icon) {
-    final scheme = Theme.of(context).colorScheme;
-    return Row(
-      children: [
-        Icon(icon, size: 20, color: scheme.primary),
-        const SizedBox(width: 8),
-        Expanded(
-          child: Text(label, style: Theme.of(context).textTheme.bodyMedium),
-        ),
-        Text(
-          value,
-          style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-            fontWeight: FontWeight.w600,
-            color: scheme.primary,
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildStatsCard() {
-    final scheme = Theme.of(context).colorScheme;
-    final stats = _stats;
-    if (stats == null || !stats.hasData) {
-      return const SizedBox.shrink();
-    }
-
-    final maxCategorySpend = stats.categoryTotals.values.fold<double>(
-      0.0,
-      (maxValue, value) => value > maxValue ? value : maxValue,
-    );
-
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(Icons.analytics_outlined, color: scheme.primary, size: 24),
-                const SizedBox(width: 16),
-                Text(
-                  'Expense Insights',
-                  style: Theme.of(context).textTheme.titleLarge,
-                ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            _buildInfoRow(
-              'Expenses Logged',
-              '${stats.expenseCount}',
-              Icons.receipt_long,
-            ),
-            const SizedBox(height: 16),
-            _buildInfoRow(
-              'Average Expense',
-              formatCurrency(stats.averageExpense),
-              Icons.trending_up,
-            ),
-            if (stats.categoryTotals.isNotEmpty) ...[
-              const SizedBox(height: 16),
-              const Divider(),
-              const SizedBox(height: 16),
-              Text(
-                'Category Breakdown',
-                style: Theme.of(
-                  context,
-                ).textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w600),
-              ),
-              const SizedBox(height: 8),
-              ...stats.categoryTotals.entries.map((entry) {
-                final label = expenseCategories[entry.key] ?? entry.key;
-                final progress = maxCategorySpend <= 0
-                    ? 0.0
-                    : entry.value / maxCategorySpend;
-
-                return Padding(
-                  padding: const EdgeInsets.only(bottom: 8),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          Expanded(
-                            child: Text(
-                              label,
-                              style: Theme.of(context).textTheme.bodyMedium,
-                            ),
-                          ),
-                          Text(
-                            formatCurrency(entry.value),
-                            style: Theme.of(context).textTheme.bodyMedium
-                                ?.copyWith(fontWeight: FontWeight.w600),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 8),
-                      ClipRRect(
-                        borderRadius: BorderRadius.circular(8),
-                        child: LinearProgressIndicator(
-                          minHeight: 8,
-                          value: progress,
-                          backgroundColor: scheme.surfaceContainerHighest,
-                        ),
-                      ),
-                    ],
-                  ),
-                );
-              }),
-            ],
-            if (stats.memberStats.isNotEmpty) ...[
-              const SizedBox(height: 8),
-              const Divider(),
-              const SizedBox(height: 16),
-              Text(
-                'Member Net Position',
-                style: Theme.of(
-                  context,
-                ).textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w600),
-              ),
-              const SizedBox(height: 8),
-              ...stats.memberStats.map((memberStat) {
-                final net = memberStat.netBalance;
-                final amount = net.abs();
-                final color = net > 0
-                    ? scheme.primary
-                    : net < 0
-                    ? scheme.error
-                    : scheme.onSurfaceVariant;
-                final prefix = net > 0
-                    ? '+'
-                    : net < 0
-                    ? '-'
-                    : '';
-
-                return Padding(
-                  padding: const EdgeInsets.only(bottom: 8),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          memberStat.userName,
-                          style: Theme.of(context).textTheme.bodyMedium,
-                        ),
-                      ),
-                      Text(
-                        '$prefix${formatCurrency(amount)}',
-                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          color: color,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ],
-                  ),
-                );
-              }),
-            ],
-          ],
-        ),
-      ),
     );
   }
 
@@ -1247,10 +1061,35 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
     );
   }
 
+  /// Pending payments, phrased from your side: "You owe X" shows −₹ in red,
+  /// "X owes you" shows +₹ in blue, anyone else's debt stays neutral.
   Widget _buildPendingSettlementsList() {
     final scheme = Theme.of(context).colorScheme;
     return Column(
       children: _pendingSettlements.map((settlement) {
+        final youPay = settlement.fromUserId == _currentUserId;
+        final youReceive = settlement.toUserId == _currentUserId;
+        final fromName = youPay ? 'You' : settlement.fromUserName;
+        final toName = youReceive ? 'you' : settlement.toUserName;
+        final verb = youPay ? ' owe ' : ' owes ';
+
+        final Color chipColor;
+        final Color chipTextColor;
+        final String amountText;
+        if (youPay) {
+          chipColor = scheme.errorContainer;
+          chipTextColor = scheme.onErrorContainer;
+          amountText = formatCurrency(-settlement.amount);
+        } else if (youReceive) {
+          chipColor = scheme.primaryContainer;
+          chipTextColor = scheme.onPrimaryContainer;
+          amountText = formatSignedCurrency(settlement.amount);
+        } else {
+          chipColor = scheme.tertiaryContainer;
+          chipTextColor = scheme.onTertiaryContainer;
+          amountText = formatCurrency(settlement.amount);
+        }
+
         return Card(
           margin: const EdgeInsets.only(bottom: 16),
           child: Padding(
@@ -1263,12 +1102,12 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
                     style: Theme.of(context).textTheme.bodyLarge,
                     children: [
                       TextSpan(
-                        text: settlement.fromUserName,
+                        text: fromName,
                         style: const TextStyle(fontWeight: FontWeight.w600),
                       ),
-                      const TextSpan(text: ' owes '),
+                      TextSpan(text: verb),
                       TextSpan(
-                        text: settlement.toUserName,
+                        text: toName,
                         style: const TextStyle(fontWeight: FontWeight.w600),
                       ),
                     ],
@@ -1284,15 +1123,15 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
                         vertical: 8,
                       ),
                       decoration: BoxDecoration(
-                        color: scheme.tertiaryContainer,
+                        color: chipColor,
                         borderRadius: BorderRadius.circular(16),
                       ),
                       child: Text(
-                        formatCurrency(settlement.amount),
+                        amountText,
                         style: Theme.of(context).textTheme.titleMedium
                             ?.copyWith(
                               fontWeight: FontWeight.w600,
-                              color: scheme.onTertiaryContainer,
+                              color: chipTextColor,
                             ),
                       ),
                     ),
@@ -1368,6 +1207,11 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
                     color: scheme.onSurfaceVariant,
                   ),
                 ),
+                IconButton(
+                  icon: const Icon(Icons.undo, size: 20),
+                  tooltip: 'Undo payment',
+                  onPressed: () => _showUndoPaymentDialog(settlement),
+                ),
               ],
             ),
           ),
@@ -1376,48 +1220,91 @@ class _GroupDetailsPageState extends State<GroupDetailsPage> {
     );
   }
 
-  void _showMarkAsPaidDialog(Settlement settlement) {
-    showDialog(
+  /// Confirms a payment. The amount defaults to the full suggestion and can
+  /// be lowered to record a partial payment.
+  Future<void> _showMarkAsPaidDialog(Settlement settlement) async {
+    final amountController = TextEditingController(
+      text: settlement.amount.toStringAsFixed(2),
+    );
+    final formKey = GlobalKey<FormState>();
+
+    final amount = await showDialog<double>(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (dialogContext) => AlertDialog(
         title: const Text('Confirm Payment'),
-        content: RichText(
-          text: TextSpan(
-            style: Theme.of(context).textTheme.bodyLarge,
+        content: Form(
+          key: formKey,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const TextSpan(text: 'Mark payment from '),
-              TextSpan(
-                text: settlement.fromUserName,
-                style: const TextStyle(fontWeight: FontWeight.w600),
+              RichText(
+                text: TextSpan(
+                  style: Theme.of(dialogContext).textTheme.bodyLarge,
+                  children: [
+                    TextSpan(
+                      text: settlement.fromUserName,
+                      style: const TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                    const TextSpan(text: ' paid '),
+                    TextSpan(
+                      text: settlement.toUserName,
+                      style: const TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                  ],
+                ),
               ),
-              const TextSpan(text: ' to '),
-              TextSpan(
-                text: settlement.toUserName,
-                style: const TextStyle(fontWeight: FontWeight.w600),
+              const SizedBox(height: 16),
+              TextFormField(
+                controller: amountController,
+                decoration: InputDecoration(
+                  labelText: 'Amount paid',
+                  prefixText: '$currencySymbol ',
+                  helperText:
+                      'Owed: ${formatCurrency(settlement.amount)} · '
+                      'enter less for a partial payment',
+                ),
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
+                ),
+                autofocus: true,
+                validator: (value) {
+                  final paid = double.tryParse(value?.trim() ?? '');
+                  if (paid == null || paid <= 0) {
+                    return 'Enter an amount greater than 0';
+                  }
+                  if (paid > settlement.amount + 0.005) {
+                    return 'More than the ${formatCurrency(settlement.amount)} owed';
+                  }
+                  return null;
+                },
               ),
-              const TextSpan(text: ' of '),
-              TextSpan(
-                text: formatCurrency(settlement.amount),
-                style: const TextStyle(fontWeight: FontWeight.w600),
-              ),
-              const TextSpan(text: ' as paid?'),
             ],
           ),
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.of(context).pop(),
+            onPressed: () => Navigator.of(dialogContext).pop(),
             child: const Text('Cancel'),
           ),
           ElevatedButton(
             onPressed: () {
-              Navigator.of(context).pop();
-              _markAsPaid(settlement);
+              if (formKey.currentState!.validate()) {
+                Navigator.of(
+                  dialogContext,
+                ).pop(double.parse(amountController.text.trim()));
+              }
             },
             child: const Text('Confirm'),
           ),
         ],
       ),
     );
+
+    amountController.dispose();
+
+    if (amount != null) {
+      await _markAsPaid(settlement, amount);
+    }
   }
 }

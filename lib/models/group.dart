@@ -1,5 +1,3 @@
-import '../utils/currency.dart';
-
 class Group {
   final String id;
   final String name;
@@ -38,64 +36,13 @@ class Group {
 
 class GroupBalanceView {
   final Group group;
+
+  /// The current user's net position in this group:
+  /// positive = others owe you, negative = you owe others.
   final double netBalance;
 
   GroupBalanceView({
     required this.group,
     required this.netBalance,
   });
-
-  String balanceText([String? symbol]) {
-    if (netBalance > 0) {
-      return 'You are owed ${formatCurrency(netBalance, symbol: symbol)}';
-    } else if (netBalance < 0) {
-      return 'You owe ${formatCurrency(-netBalance, symbol: symbol)}';
-    } else {
-      return 'Settled up';
-    }
-  }
-}
-
-class ExpenseSplit {
-  final String id;
-  final String groupId;
-  final String fromUserId;
-  final String toUserId;
-  final double amount;
-  final String? description;
-  final int createdAt;
-
-  ExpenseSplit({
-    required this.id,
-    required this.groupId,
-    required this.fromUserId,
-    required this.toUserId,
-    required this.amount,
-    this.description,
-    required this.createdAt,
-  });
-
-  Map<String, dynamic> toMap() {
-    return {
-      'id': id,
-      'groupId': groupId,
-      'fromUserId': fromUserId,
-      'toUserId': toUserId,
-      'amount': amount,
-      'description': description,
-      'createdAt': createdAt,
-    };
-  }
-
-  factory ExpenseSplit.fromMap(Map<String, dynamic> map) {
-    return ExpenseSplit(
-      id: map['id'] as String,
-      groupId: map['groupId'] as String,
-      fromUserId: map['fromUserId'] as String,
-      toUserId: map['toUserId'] as String,
-      amount: map['amount'] as double,
-      description: map['description'] as String?,
-      createdAt: map['createdAt'] as int,
-    );
-  }
 }
